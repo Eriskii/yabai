@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- Fixed minor memory leak on space destruction, and added a few missing null checks to SkyLight API calls [#2791](https://github.com/asmvik/yabai/issues/2791)
 
 ## [7.1.25] - 2026-05-08
 ### Changed
