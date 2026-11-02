@@ -586,15 +586,20 @@ static struct application *event_loop_application_for_window_id(uint32_t window_
 
 //
 // NOTE(eriskii): Some applications never post a usable kAXCreatedNotification for some of their
-// windows; Firefox does not for a tab that is dragged out into its own window, even though the
-// window shows up in its kAXWindowsAttribute right away. Asking for that list again is cheap, so
-// do it whenever there is a hint that a window may have been missed.
+// windows, and may leave them out of kAXWindowsAttribute as well; Firefox does both for a tab that
+// is dragged out into its own window. Whenever there is a hint that a window may have been missed,
+// re-read the window list, and if that turns up nothing, look for windows that the window server
+// says the application owns but that we do not know about.
 //
 
 static int event_loop_discover_application_windows(struct application *application)
 {
     int window_count = 0;
     struct window **window_list = window_manager_add_application_windows(&g_space_manager, &g_window_manager, application, &window_count);
+
+    if (!window_count) {
+        window_list = window_manager_resolve_missing_application_windows(&g_space_manager, &g_window_manager, application, &window_count);
+    }
 
     for (int i = 0; i < window_count; ++i) {
         event_loop_manage_created_window(window_list[i]);

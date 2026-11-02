@@ -1770,6 +1770,103 @@ static uint32_t *window_manager_existing_application_window_list(struct applicat
     return space_list ? space_window_list_for_connection(space_list, space_count, application ? application->connection : 0, window_count, true) : NULL;
 }
 
+static bool window_manager_is_window_unresolvable(struct window_manager *wm, uint32_t wid)
+{
+    for (int i = 0; i < buf_len(wm->unresolvable_window_list); ++i) {
+        if (wm->unresolvable_window_list[i] == wid) return true;
+    }
+
+    return false;
+}
+
+//
+// NOTE(eriskii): Resolve windows that the window server says belong to the application, but that are
+// missing from its kAXWindowsAttribute (Firefox: a tab dragged out into its own window), using the same
+// remote-token workaround as window_manager_add_existing_application_windows. The search stops as soon
+// as every missing window is found; windows that cannot be resolved are remembered and not searched for
+// again, so a stray surface does not cost a full search on every rescan.
+//
+
+struct window **window_manager_resolve_missing_application_windows(struct space_manager *sm, struct window_manager *wm, struct application *application, int *count)
+{
+    *count = 0;
+
+    int global_window_count;
+    uint32_t *global_window_list = window_manager_existing_application_window_list(application, &global_window_count);
+    if (!global_window_list) return NULL;
+
+    uint32_t *missing_list = NULL;
+    for (int i = 0; i < global_window_count; ++i) {
+        uint32_t wid = global_window_list[i];
+        if (window_manager_find_window(wm, wid))           continue;
+        if (window_manager_is_window_unresolvable(wm, wid)) continue;
+        ts_buf_push(missing_list, wid);
+    }
+
+    int missing_count = ts_buf_len(missing_list);
+    if (!missing_count) return NULL;
+
+    debug("%s: %s has %d windows missing from its window list, searching\n", __FUNCTION__, application->name, missing_count);
+    struct window **list = ts_alloc_list(struct window *, missing_count);
+
+    CFMutableDataRef data_ref = CFDataCreateMutable(NULL, 0x14);
+    CFDataIncreaseLength(data_ref, 0x14);
+
+    uint8_t *data = CFDataGetMutableBytePtr(data_ref);
+    *(uint32_t *) (data + 0x0) = application->pid;
+    *(uint32_t *) (data + 0x8) = 0x636f636f;
+
+    uint64_t element_id = 0;
+    uint64_t search_start = read_os_timer();
+    uint64_t search_budget = read_os_freq() / 2;
+
+    for (; element_id < 0x7fff && ts_buf_len(missing_list) > 0; ++element_id) {
+        if ((element_id & 0xff) == 0xff && read_os_timer() - search_start > search_budget) break;
+
+        memcpy(data+0xc, &element_id, sizeof(uint64_t));
+        AXUIElementRef element_ref = _AXUIElementCreateWithRemoteToken(data_ref);
+        if (!element_ref) continue;
+
+        bool consumed = false;
+        const void *role = NULL;
+        AXUIElementCopyAttributeValue(element_ref, kAXRoleAttribute, &role);
+
+        if (role) {
+            if (CFEqual(role, kAXWindowRole)) {
+                uint32_t element_wid = ax_window_id(element_ref);
+
+                for (int i = 0; element_wid && i < ts_buf_len(missing_list); ++i) {
+                    if (missing_list[i] != element_wid) continue;
+                    ts_buf_del(missing_list, i);
+
+                    struct window *window = window_manager_create_and_add_window(sm, wm, application, element_ref, element_wid, false);
+                    if (window) {
+                        list[(*count)++] = window;
+                    } else {
+                        buf_push(wm->unresolvable_window_list, element_wid);
+                    }
+
+                    consumed = true;
+                    break;
+                }
+            }
+
+            CFRelease(role);
+        }
+
+        if (!consumed) CFRelease(element_ref);
+    }
+
+    CFRelease(data_ref);
+
+    for (int i = 0; i < ts_buf_len(missing_list); ++i) {
+        buf_push(wm->unresolvable_window_list, missing_list[i]);
+    }
+
+    debug("%s: resolved %d windows for %s, %d could not be resolved (searched %llu elements in %.1fms)\n", __FUNCTION__, *count, application->name, ts_buf_len(missing_list), element_id, (float)(read_os_timer() - search_start) * 1000.0f / (float)read_os_freq());
+    return list;
+}
+
 bool window_manager_add_existing_application_windows(struct space_manager *sm, struct window_manager *wm, struct application *application, int refresh_index)
 {
     bool result = false;
