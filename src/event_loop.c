@@ -8,6 +8,7 @@ extern enum mission_control_mode g_mission_control_mode;
 extern int g_connection;
 extern void *g_workspace_context;
 extern int g_layer_below_window_level;
+static int event_loop_discover_application_windows(struct application *application);
 volatile bool __pending_window_focus;
 volatile bool __pending_gesture;
 volatile uint64_t __last_gesture_time;
@@ -392,6 +393,8 @@ static EVENT_HANDLER(APPLICATION_FRONT_SWITCHED)
         }
     }
 
+    event_loop_discover_application_windows(application);
+
     uint32_t application_focused_window_id = application_focused_window(application);
     if (!application_focused_window_id) {
         struct window *focused_window = window_manager_find_window(&g_window_manager, g_window_manager.focused_window_id);
@@ -570,6 +573,60 @@ static void event_loop_manage_created_window(struct window *window)
     }
 }
 
+static struct application *event_loop_application_for_window_id(uint32_t window_id)
+{
+    int window_cid = 0;
+    pid_t window_pid = 0;
+
+    SLSGetWindowOwner(g_connection, window_id, &window_cid);
+    if (window_cid) SLSConnectionGetPID(window_cid, &window_pid);
+
+    return window_pid ? window_manager_find_application(&g_window_manager, window_pid) : NULL;
+}
+
+//
+// NOTE(eriskii): Some applications never post a usable kAXCreatedNotification for some of their
+// windows; Firefox does not for a tab that is dragged out into its own window, even though the
+// window shows up in its kAXWindowsAttribute right away. Asking for that list again is cheap, so
+// do it whenever there is a hint that a window may have been missed.
+//
+
+static int event_loop_discover_application_windows(struct application *application)
+{
+    int window_count = 0;
+    struct window **window_list = window_manager_add_application_windows(&g_space_manager, &g_window_manager, application, &window_count);
+
+    for (int i = 0; i < window_count; ++i) {
+        event_loop_manage_created_window(window_list[i]);
+    }
+
+    if (window_count) {
+        debug("%s: discovered %d missed windows for %s\n", __FUNCTION__, window_count, application->name);
+
+        if (workspace_is_macos_sequoia() || workspace_is_macos_tahoe()) {
+            update_window_notifications();
+        }
+    }
+
+    return window_count;
+}
+
+static void event_loop_schedule_application_rescan(pid_t pid, float delay)
+{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        event_loop_post(&g_event_loop, APPLICATION_RESCAN, NULL, pid);
+    });
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+static EVENT_HANDLER(APPLICATION_RESCAN)
+{
+    struct application *application = window_manager_find_application(&g_window_manager, (pid_t) param1);
+    if (application) event_loop_discover_application_windows(application);
+}
+#pragma clang diagnostic pop
+
 static EVENT_HANDLER(WINDOW_CREATED)
 {
     uint32_t window_id = ax_window_id(context);
@@ -672,26 +729,8 @@ static EVENT_HANDLER(WINDOW_FOCUSED)
         // focus event re-posts WINDOW_FOCUSED for itself once it has been added.
         //
 
-        int window_cid = 0;
-        pid_t window_pid = 0;
-        SLSGetWindowOwner(g_connection, window_id, &window_cid);
-        if (window_cid) SLSConnectionGetPID(window_cid, &window_pid);
-
-        struct application *application = window_pid ? window_manager_find_application(&g_window_manager, window_pid) : NULL;
-        if (application) {
-            int window_count = 0;
-            struct window **window_list = window_manager_add_application_windows(&g_space_manager, &g_window_manager, application, &window_count);
-            debug("%s: %d is unknown, rescanned %s and found %d new windows\n", __FUNCTION__, window_id, application->name, window_count);
-
-            for (int i = 0; i < window_count; ++i) {
-                event_loop_manage_created_window(window_list[i]);
-            }
-
-            if (window_count && (workspace_is_macos_sequoia() || workspace_is_macos_tahoe())) {
-                update_window_notifications();
-            }
-        }
-
+        struct application *application = event_loop_application_for_window_id(window_id);
+        if (application) event_loop_discover_application_windows(application);
         return;
     }
 
@@ -1174,6 +1213,27 @@ static EVENT_HANDLER(MOUSE_DOWN)
     debug("%s: %.2f, %.2f\n", __FUNCTION__, point.x, point.y);
 
     struct window *window = window_manager_find_window_at_point(&g_window_manager, point);
+
+    if (!window) {
+
+        //
+        // NOTE(eriskii): The click landed on a window we do not know about; its application may have
+        // created it without telling us. Rescan that application before handling the click.
+        //
+
+        CGPoint window_point;
+        uint32_t window_id = 0;
+        int window_cid = 0;
+
+        SLSFindWindowAndOwner(g_connection, 0, 1, 0, &point, &window_point, &window_id, &window_cid);
+        if (window_id && window_cid != g_connection) {
+            struct application *application = event_loop_application_for_window_id(window_id);
+            if (application && event_loop_discover_application_windows(application)) {
+                window = window_manager_find_window_at_point(&g_window_manager, point);
+            }
+        }
+    }
+
     if (!window || window_check_flag(window, WINDOW_FULLSCREEN)) goto out;
 
     g_mouse_state.window = window;
@@ -1235,6 +1295,21 @@ static EVENT_HANDLER(MOUSE_UP)
     }
 
     debug("%s: %.2f, %.2f\n", __FUNCTION__, point.x, point.y);
+
+    if (!g_mouse_state.picked_up && !g_mouse_state.live_resize) {
+        float dx = point.x - g_mouse_state.down_location.x;
+        float dy = point.y - g_mouse_state.down_location.y;
+
+        //
+        // NOTE(eriskii): A drag inside a window just ended (a tab being dragged out, for example), and the
+        // application may be about to create a window that it never announces. Check back shortly.
+        //
+
+        if ((dx * dx + dy * dy) >= (8.0f * 8.0f)) {
+            event_loop_schedule_application_rescan(g_mouse_state.window->application->pid, 0.3f);
+            event_loop_schedule_application_rescan(g_mouse_state.window->application->pid, 1.0f);
+        }
+    }
 
     if (g_mouse_state.picked_up) {
         mouse_drop_picked_up_window(&g_space_manager, &g_window_manager, &g_mouse_state, point, false);
