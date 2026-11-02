@@ -71,6 +71,26 @@ struct scratchpad
     struct window *window;
 };
 
+enum window_animation_style
+{
+    ANIMATION_STYLE_SCALE,
+    ANIMATION_STYLE_STEPPED
+};
+
+static char *window_animation_style_str[] =
+{
+    "scale",
+    "stepped"
+};
+
+struct window_step
+{
+    struct window *window;
+    uint32_t wid;
+    CGRect from;
+    CGRect to;
+};
+
 struct window_manager
 {
     AXUIElementRef system_element;
@@ -98,6 +118,13 @@ struct window_manager
     float window_opacity_duration;
     float window_animation_duration;
     int window_animation_easing;
+    enum window_animation_style window_animation_style;
+    struct window_step *step_list;
+    uint64_t step_clock;
+    float step_duration;
+    int step_easing;
+    CVDisplayLinkRef step_link;
+    volatile bool step_tick_pending;
     bool suppress_animations;
     struct rgba_color insert_feedback_color;
     struct scratchpad *scratchpad_window;
@@ -120,6 +147,9 @@ void window_manager_move_window(struct window *window, float x, float y);
 void window_manager_resize_window(struct window *window, float width, float height);
 enum window_op_error window_manager_adjust_window_ratio(struct window_manager *wm, struct window *window, int action, float ratio);
 void window_manager_animate_window(struct window_capture capture);
+void window_manager_step_animation_tick(struct window_manager *wm);
+void window_manager_cancel_step_animation(struct window_manager *wm, uint32_t wid);
+bool window_manager_is_window_stepping(struct window_manager *wm, uint32_t wid);
 void window_manager_animate_window_list(struct window_capture *window_list, int window_count);
 void window_manager_set_window_frame(struct window *window, float x, float y, float width, float height);
 int window_manager_find_rank_of_window_in_list(uint32_t wid, uint32_t *window_list, int window_count);

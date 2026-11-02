@@ -385,6 +385,7 @@ void window_node_flush_immediate(struct window_node *node, uint32_t exclude_wid)
 
     for (int i = 0; i < ts_buf_len(window_list); ++i) {
         if (window_list[i].window->id == exclude_wid) continue;
+        window_manager_cancel_step_animation(&g_window_manager, window_list[i].window->id);
         window_manager_set_window_frame(window_list[i].window, window_list[i].x, window_list[i].y, window_list[i].w, window_list[i].h);
     }
 }

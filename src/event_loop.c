@@ -702,7 +702,7 @@ static EVENT_HANDLER(WINDOW_MOVED)
     if (!windowed_fullscreen) {
         window_clear_flag(window, WINDOW_WINDOWED);
 
-        if (!g_mouse_state.live_resize && (!g_mouse_state.window || g_mouse_state.window != window)) {
+        if (!g_mouse_state.live_resize && !window_manager_is_window_stepping(&g_window_manager, window->id) && (!g_mouse_state.window || g_mouse_state.window != window)) {
             struct view *view = window_manager_find_managed_window(&g_window_manager, window);
             if (view) {
                 struct window_node *node = view_find_window_node(view, window->id);
@@ -801,7 +801,7 @@ static EVENT_HANDLER(WINDOW_RESIZED)
         if (!windowed_fullscreen) {
             window_clear_flag(window, WINDOW_WINDOWED);
 
-            if (!g_mouse_state.live_resize && (!g_mouse_state.window || g_mouse_state.window != window)) {
+            if (!g_mouse_state.live_resize && !window_manager_is_window_stepping(&g_window_manager, window->id) && (!g_mouse_state.window || g_mouse_state.window != window)) {
                 struct view *view = window_manager_find_managed_window(&g_window_manager, window);
                 if (view) {
                     struct window_node *node = view_find_window_node(view, window->id);
@@ -1613,6 +1613,14 @@ static EVENT_HANDLER(SYSTEM_WOKE)
 
     event_signal_push(SIGNAL_SYSTEM_WOKE, NULL);
 }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+static EVENT_HANDLER(WINDOW_ANIMATION_STEP)
+{
+    window_manager_step_animation_tick(&g_window_manager);
+}
+#pragma clang diagnostic pop
 
 static EVENT_HANDLER(DAEMON_MESSAGE)
 {

@@ -357,6 +357,7 @@ void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoin
     }
 
     if (ms->current_action == MOUSE_MODE_RESIZE) {
+        window_manager_cancel_step_animation(wm, ms->window->id);
         ms->live_resize  = true;
         ms->drag_decided = true;
         return;
@@ -385,6 +386,7 @@ void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoin
         SLSGetWindowBounds(g_connection, ms->window->id, &frame);
 
         if (AX_DIFF(frame.size.width, ms->down_frame.size.width) || AX_DIFF(frame.size.height, ms->down_frame.size.height)) {
+            window_manager_cancel_step_animation(wm, ms->window->id);
             ms->live_resize  = true;
             ms->drag_decided = true;
             return;
@@ -398,6 +400,7 @@ void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoin
     ms->drag_decided = true;
     if (!pick_up) return;
 
+    window_manager_cancel_step_animation(wm, ms->window->id);
     mouse_clear_drop_feedback(ms);
 
     struct window_node *flush_node = view_detach_window_node(view, ms->window, &ms->pickup);

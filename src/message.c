@@ -32,6 +32,7 @@ extern bool g_verbose;
 #define COMMAND_CONFIG_OPACITY_DURATION      "window_opacity_duration"
 #define COMMAND_CONFIG_ANIMATION_DURATION    "window_animation_duration"
 #define COMMAND_CONFIG_ANIMATION_EASING      "window_animation_easing"
+#define COMMAND_CONFIG_ANIMATION_STYLE       "window_animation_style"
 #define COMMAND_CONFIG_SHADOW                "window_shadow"
 #define COMMAND_CONFIG_MENUBAR_OPACITY       "menubar_opacity"
 #define COMMAND_CONFIG_ACTIVE_WINDOW_OPACITY "active_window_opacity"
@@ -1299,7 +1300,7 @@ static void handle_domain_config(FILE *rsp, struct token domain, char *message)
             if (value.type == TOKEN_TYPE_INVALID) {
                 fprintf(rsp, "%f\n", g_window_manager.window_animation_duration);
             } else if (value.type == TOKEN_TYPE_FLOAT) {
-                if (value.float_value == 0.0f) {
+                if (value.float_value == 0.0f || g_window_manager.window_animation_style == ANIMATION_STYLE_STEPPED) {
                     g_window_manager.window_animation_duration = value.float_value;
                 } else if (!scripting_addition_is_sip_friendly()) {
                     daemon_fail(rsp, "command '%.*s' for domain '%.*s' requires System Integrity Protection to be partially disabled! ignoring request..\n", command.length, command.text, domain.length, domain.text);
@@ -1326,6 +1327,17 @@ static void handle_domain_config(FILE *rsp, struct token domain, char *message)
                     }
                 }
                 if (!match) daemon_fail(rsp, "unknown value '%.*s' given to command '%.*s' for domain '%.*s'\n", value.length, value.text, command.length, command.text, domain.length, domain.text);
+            }
+        } else if (token_equals(command, COMMAND_CONFIG_ANIMATION_STYLE)) {
+            struct token value = get_token(&message);
+            if (!token_is_valid(value)) {
+                fprintf(rsp, "%s\n", window_animation_style_str[g_window_manager.window_animation_style]);
+            } else if (token_equals(value, window_animation_style_str[ANIMATION_STYLE_SCALE])) {
+                g_window_manager.window_animation_style = ANIMATION_STYLE_SCALE;
+            } else if (token_equals(value, window_animation_style_str[ANIMATION_STYLE_STEPPED])) {
+                g_window_manager.window_animation_style = ANIMATION_STYLE_STEPPED;
+            } else {
+                daemon_fail(rsp, "unknown value '%.*s' given to command '%.*s' for domain '%.*s'\n", value.length, value.text, command.length, command.text, domain.length, domain.text);
             }
         } else if (token_equals(command, COMMAND_CONFIG_SHADOW)) {
             struct token value = get_token(&message);

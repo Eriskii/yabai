@@ -702,6 +702,164 @@ void window_manager_animate_window_list_async(struct window_capture *window_list
     CVDisplayLinkStart(link);
 }
 
+//
+// NOTE(eriskii): Stepped animations resize the real windows a little on every display refresh,
+// so applications re-layout their content at each intermediate size. The default animation
+// scales a screenshot of the window instead, which looks squished until it is swapped out.
+//
+// The display link only posts an event; every frame is applied on the event loop thread, in
+// order with everything else that touches the layout. At most one step event is queued at a
+// time, so a slow application lowers the frame rate instead of building up a backlog.
+//
+
+static inline CGRect window_step_lerp(CGRect a, float t, CGRect b)
+{
+    return (CGRect) {{ lerp(a.origin.x, t, b.origin.x), lerp(a.origin.y, t, b.origin.y) }, { lerp(a.size.width, t, b.size.width), lerp(a.size.height, t, b.size.height) }};
+}
+
+static float window_manager_step_ease(int easing, float t)
+{
+    switch (easing) {
+#define ANIMATION_EASING_TYPE_ENTRY(value) case value##_type: return value(t);
+        ANIMATION_EASING_TYPE_LIST
+#undef ANIMATION_EASING_TYPE_ENTRY
+    }
+
+    return t;
+}
+
+static float window_manager_step_progress(struct window_manager *wm)
+{
+    if (wm->step_duration <= 0.0f) return 1.0f;
+
+    float t = (float)(read_os_timer() - wm->step_clock) / (wm->step_duration * (float)read_os_freq());
+    return clampf_range(t, 0.0f, 1.0f);
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+static CVReturn window_manager_step_animation_display_link_proc(CVDisplayLinkRef link, const CVTimeStamp *now, const CVTimeStamp *output_time, CVOptionFlags flags, CVOptionFlags *flags_out, void *data)
+{
+    struct window_manager *wm = data;
+
+    if (__sync_bool_compare_and_swap(&wm->step_tick_pending, false, true)) {
+        event_loop_post(&g_event_loop, WINDOW_ANIMATION_STEP, NULL, 0);
+    }
+
+    return kCVReturnSuccess;
+}
+#pragma clang diagnostic pop
+
+static struct window_step *window_manager_find_step(struct window_manager *wm, uint32_t wid)
+{
+    for (int i = 0; i < buf_len(wm->step_list); ++i) {
+        if (wm->step_list[i].wid == wid) return &wm->step_list[i];
+    }
+
+    return NULL;
+}
+
+static void window_manager_animate_window_list_stepped(struct window_manager *wm, struct window_capture *window_list, int window_count)
+{
+    float mt = window_manager_step_ease(wm->step_easing, window_manager_step_progress(wm));
+    struct window_step *step_list = NULL;
+
+    //
+    // NOTE(eriskii): Windows that are already in flight continue from wherever they are right now,
+    // both the ones that get a new target and the ones that keep their old one.
+    //
+
+    for (int i = 0; i < buf_len(wm->step_list); ++i) {
+        struct window_step *step = &wm->step_list[i];
+
+        bool retargeted = false;
+        for (int j = 0; j < window_count; ++j) {
+            if (window_list[j].window->id == step->wid) {
+                retargeted = true;
+                break;
+            }
+        }
+
+        if (!retargeted) {
+            buf_push(step_list, ((struct window_step) { step->window, step->wid, window_step_lerp(step->from, mt, step->to), step->to }));
+        }
+    }
+
+    for (int i = 0; i < window_count; ++i) {
+        struct window *window = window_list[i].window;
+        CGRect to = {{ window_list[i].x, window_list[i].y }, { window_list[i].w, window_list[i].h }};
+
+        CGRect from;
+        struct window_step *existing = window_manager_find_step(wm, window->id);
+        if (existing) {
+            from = window_step_lerp(existing->from, mt, existing->to);
+        } else {
+            SLSGetWindowBounds(g_connection, window->id, &from);
+        }
+
+        if (CGRectEqualToRect(from, to)) continue;
+        buf_push(step_list, ((struct window_step) { window, window->id, from, to }));
+    }
+
+    buf_free(wm->step_list);
+    wm->step_list     = step_list;
+    wm->step_clock    = read_os_timer();
+    wm->step_duration = wm->window_animation_duration;
+    wm->step_easing   = wm->window_animation_easing;
+
+    if (!wm->step_list) return;
+
+    if (!wm->step_link) {
+        CVDisplayLinkCreateWithActiveCGDisplays(&wm->step_link);
+        CVDisplayLinkSetOutputCallback(wm->step_link, window_manager_step_animation_display_link_proc, wm);
+    }
+
+    if (!CVDisplayLinkIsRunning(wm->step_link)) CVDisplayLinkStart(wm->step_link);
+}
+
+void window_manager_step_animation_tick(struct window_manager *wm)
+{
+    __atomic_store_n(&wm->step_tick_pending, false, __ATOMIC_RELEASE);
+
+    int step_count = buf_len(wm->step_list);
+    if (!step_count) {
+        if (wm->step_link) CVDisplayLinkStop(wm->step_link);
+        return;
+    }
+
+    float t  = window_manager_step_progress(wm);
+    float mt = window_manager_step_ease(wm->step_easing, t);
+
+    for (int i = 0; i < step_count; ++i) {
+        struct window_step *step = &wm->step_list[i];
+        if (window_manager_find_window(wm, step->wid) != step->window) continue;
+
+        CGRect frame = window_step_lerp(step->from, mt, step->to);
+        window_manager_set_window_frame(step->window, roundf(frame.origin.x), roundf(frame.origin.y), roundf(frame.size.width), roundf(frame.size.height));
+    }
+
+    if (t >= 1.0f) {
+        buf_free(wm->step_list);
+        wm->step_list = NULL;
+        CVDisplayLinkStop(wm->step_link);
+    }
+}
+
+void window_manager_cancel_step_animation(struct window_manager *wm, uint32_t wid)
+{
+    for (int i = 0; i < buf_len(wm->step_list); ++i) {
+        if (wm->step_list[i].wid == wid) {
+            buf_del(wm->step_list, i);
+            return;
+        }
+    }
+}
+
+bool window_manager_is_window_stepping(struct window_manager *wm, uint32_t wid)
+{
+    return window_manager_find_step(wm, wid) != NULL;
+}
+
 void window_manager_animate_window_list(struct window_capture *window_list, int window_count)
 {
     TIME_FUNCTION;
@@ -714,9 +872,14 @@ void window_manager_animate_window_list(struct window_capture *window_list, int 
     if (g_window_manager.suppress_animations) return;
 
     if (g_window_manager.window_animation_duration) {
-        window_manager_animate_window_list_async(window_list, window_count);
+        if (g_window_manager.window_animation_style == ANIMATION_STYLE_STEPPED) {
+            window_manager_animate_window_list_stepped(&g_window_manager, window_list, window_count);
+        } else {
+            window_manager_animate_window_list_async(window_list, window_count);
+        }
     } else {
         for (int i = 0; i < window_count; ++i) {
+            window_manager_cancel_step_animation(&g_window_manager, window_list[i].window->id);
             window_manager_set_window_frame(window_list[i].window, window_list[i].x, window_list[i].y, window_list[i].w, window_list[i].h);
         }
     }
@@ -726,13 +889,7 @@ void window_manager_animate_window(struct window_capture capture)
 {
     TIME_FUNCTION;
 
-    if (g_window_manager.suppress_animations) return;
-
-    if (g_window_manager.window_animation_duration) {
-        window_manager_animate_window_list_async(&capture, 1);
-    } else {
-        window_manager_set_window_frame(capture.window, capture.x, capture.y, capture.w, capture.h);
-    }
+    window_manager_animate_window_list(&capture, 1);
 }
 
 void window_manager_set_window_frame(struct window *window, float x, float y, float width, float height)
@@ -2731,6 +2888,7 @@ void window_manager_init(struct window_manager *wm)
     wm->window_opacity_duration = 0.0f;
     wm->window_animation_duration = 0.0f;
     wm->window_animation_easing = ease_out_circ_type;
+    wm->window_animation_style = ANIMATION_STYLE_SCALE;
     wm->insert_feedback_color = rgba_color_from_hex(0xffd75f5f);
 
     table_init(&wm->application, 150, hash_wm, compare_wm);
