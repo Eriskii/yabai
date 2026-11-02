@@ -548,10 +548,51 @@ static EVENT_HANDLER(APPLICATION_HIDDEN)
     event_signal_push(SIGNAL_APPLICATION_HIDDEN, application);
 }
 
+static void event_loop_manage_created_window(struct window *window)
+{
+    if (window_manager_should_manage_window(window) && !window_manager_find_managed_window(&g_window_manager, window)) {
+        uint64_t sid;
+
+        if (g_window_manager.window_origin_mode == WINDOW_ORIGIN_DEFAULT) {
+            sid = window_space(window->id);
+        } else if (g_window_manager.window_origin_mode == WINDOW_ORIGIN_FOCUSED) {
+            sid = g_space_manager.current_space_id;
+        } else /* if (g_window_manager.window_origin_mode == WINDOW_ORIGIN_CURSOR) */ {
+            sid = space_manager_cursor_space();
+        }
+
+        struct view *view = space_manager_tile_window_on_space(&g_space_manager, window, sid);
+        window_manager_add_managed_window(&g_window_manager, window, view);
+    }
+
+    if (window_manager_is_window_eligible(window)) {
+        event_signal_push(SIGNAL_WINDOW_CREATED, window);
+    }
+}
+
 static EVENT_HANDLER(WINDOW_CREATED)
 {
     uint32_t window_id = ax_window_id(context);
-    if (!window_id) { CFRelease(context); return; }
+    if (!window_id) {
+
+        //
+        // NOTE(eriskii): Some applications announce a window before the window server has backed it
+        // (Firefox does this for a tab that is dragged out into its own window). Upstream drops the
+        // notification and never learns about the window; retry for a little while instead.
+        //
+
+        if (param1 < 20) {
+            int attempt = param1 + 1;
+            debug("%s: window has no id yet, retrying (%d)\n", __FUNCTION__, attempt);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.05f * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                event_loop_post(&g_event_loop, WINDOW_CREATED, context, attempt);
+            });
+        } else {
+            CFRelease(context);
+        }
+
+        return;
+    }
 
     struct window *existing_window = window_manager_find_window(&g_window_manager, window_id);
     if (existing_window) { CFRelease(context); return; }
@@ -576,24 +617,7 @@ static EVENT_HANDLER(WINDOW_CREATED)
         }
     }
 
-    if (window_manager_should_manage_window(window) && !window_manager_find_managed_window(&g_window_manager, window)) {
-        uint64_t sid;
-
-        if (g_window_manager.window_origin_mode == WINDOW_ORIGIN_DEFAULT) {
-            sid = window_space(window->id);
-        } else if (g_window_manager.window_origin_mode == WINDOW_ORIGIN_FOCUSED) {
-            sid = g_space_manager.current_space_id;
-        } else /* if (g_window_manager.window_origin_mode == WINDOW_ORIGIN_CURSOR) */ {
-            sid = space_manager_cursor_space();
-        }
-
-        struct view *view = space_manager_tile_window_on_space(&g_space_manager, window, sid);
-        window_manager_add_managed_window(&g_window_manager, window, view);
-    }
-
-    if (window_manager_is_window_eligible(window)) {
-        event_signal_push(SIGNAL_WINDOW_CREATED, window);
-    }
+    event_loop_manage_created_window(window);
 
     if (workspace_is_macos_sequoia() || workspace_is_macos_tahoe()) {
         update_window_notifications();
@@ -641,6 +665,33 @@ static EVENT_HANDLER(WINDOW_FOCUSED)
     struct window *window = window_manager_find_window(&g_window_manager, window_id);
     if (!window) {
         window_manager_add_lost_focused_event(&g_window_manager, window_id);
+
+        //
+        // NOTE(eriskii): A window we have never heard of just received focus, so its creation was
+        // missed. Rescan the owning application; any window found here that has a pending lost
+        // focus event re-posts WINDOW_FOCUSED for itself once it has been added.
+        //
+
+        int window_cid = 0;
+        pid_t window_pid = 0;
+        SLSGetWindowOwner(g_connection, window_id, &window_cid);
+        if (window_cid) SLSConnectionGetPID(window_cid, &window_pid);
+
+        struct application *application = window_pid ? window_manager_find_application(&g_window_manager, window_pid) : NULL;
+        if (application) {
+            int window_count = 0;
+            struct window **window_list = window_manager_add_application_windows(&g_space_manager, &g_window_manager, application, &window_count);
+            debug("%s: %d is unknown, rescanned %s and found %d new windows\n", __FUNCTION__, window_id, application->name, window_count);
+
+            for (int i = 0; i < window_count; ++i) {
+                event_loop_manage_created_window(window_list[i]);
+            }
+
+            if (window_count && (workspace_is_macos_sequoia() || workspace_is_macos_tahoe())) {
+                update_window_notifications();
+            }
+        }
+
         return;
     }
 
