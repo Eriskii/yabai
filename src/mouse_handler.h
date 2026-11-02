@@ -75,9 +75,14 @@ struct mouse_state
     uint64_t last_moved_time;
     struct window *window;
     CGRect window_frame;
+    CGRect down_frame;
     uint32_t ffm_window_id;
     uint8_t direction;
     struct window_node *feedback_node;
+    bool drag_decided;
+    bool live_resize;
+    bool picked_up;
+    struct window_node_detach pickup;
 };
 
 static char *mouse_mod_str[] =
@@ -106,6 +111,13 @@ void mouse_drop_action_swap(struct window_manager *wm, struct view *src_view, st
 void mouse_drop_action_warp(struct window_manager *wm, struct view *src_view, struct window_node *src_node, struct window *src_window, struct view *dst_view, struct window_node *dst_node, struct window *dst_window, enum window_node_split split, enum window_node_child child);
 void mouse_drop_no_target(struct space_manager *sm, struct window_manager *wm, struct view *src_view, struct view *dst_view, struct window *window, struct window_node *node);
 void mouse_drop_try_adjust_bsp_grid(struct window_manager *wm, struct view *view, struct window *window, struct mouse_window_info *info);
+void mouse_show_drop_feedback(struct mouse_state *ms, struct window_node *a_node, struct window *window, struct window_node *b_node, CGPoint point);
+void mouse_clear_drop_feedback(struct mouse_state *ms);
+
+void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoint point);
+void mouse_live_resize_update(struct window_manager *wm, struct mouse_state *ms, CGPoint point, bool final);
+void mouse_picked_up_update_feedback(struct space_manager *sm, struct window_manager *wm, struct mouse_state *ms, CGPoint point);
+void mouse_drop_picked_up_window(struct space_manager *sm, struct window_manager *wm, struct mouse_state *ms, CGPoint point, bool restore);
 
 void mouse_state_init(struct mouse_state *mouse_state);
 bool mouse_handler_begin(struct mouse_state *mouse_state, uint32_t mask);

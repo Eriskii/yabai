@@ -702,7 +702,7 @@ static EVENT_HANDLER(WINDOW_MOVED)
     if (!windowed_fullscreen) {
         window_clear_flag(window, WINDOW_WINDOWED);
 
-        if (!g_mouse_state.window || g_mouse_state.window != window) {
+        if (!g_mouse_state.live_resize && (!g_mouse_state.window || g_mouse_state.window != window)) {
             struct view *view = window_manager_find_managed_window(&g_window_manager, window);
             if (view) {
                 struct window_node *node = view_find_window_node(view, window->id);
@@ -801,7 +801,7 @@ static EVENT_HANDLER(WINDOW_RESIZED)
         if (!windowed_fullscreen) {
             window_clear_flag(window, WINDOW_WINDOWED);
 
-            if (!g_mouse_state.window || g_mouse_state.window != window) {
+            if (!g_mouse_state.live_resize && (!g_mouse_state.window || g_mouse_state.window != window)) {
                 struct view *view = window_manager_find_managed_window(&g_window_manager, window);
                 if (view) {
                     struct window_node *node = view_find_window_node(view, window->id);
@@ -1129,6 +1129,10 @@ static EVENT_HANDLER(MOUSE_DOWN)
     g_mouse_state.window_frame = g_mouse_state.window->frame;
     g_mouse_state.down_location = point;
     g_mouse_state.direction = 0;
+    g_mouse_state.drag_decided = false;
+    g_mouse_state.live_resize = false;
+    g_mouse_state.picked_up = false;
+    SLSGetWindowBounds(g_connection, window->id, &g_mouse_state.down_frame);
 
     int64_t button = CGEventGetIntegerValueField(context, kCGMouseEventButtonNumber);
     uint8_t mod = (uint8_t) param1;
@@ -1153,8 +1157,21 @@ out:
 
 static EVENT_HANDLER(MOUSE_UP)
 {
-    if (mission_control_is_active()) goto out;
-    if (!g_mouse_state.window)       goto res;
+    CGPoint point = CGEventGetLocation(context);
+
+    if (mission_control_is_active()) {
+        if (g_mouse_state.picked_up && g_mouse_state.window &&
+            __sync_bool_compare_and_swap(&g_mouse_state.window->id_ptr, &g_mouse_state.window->id, &g_mouse_state.window->id)) {
+            mouse_drop_picked_up_window(&g_space_manager, &g_window_manager, &g_mouse_state, point, true);
+        }
+
+        g_mouse_state.picked_up = false;
+
+        g_mouse_state.live_resize = false;
+        goto out;
+    }
+
+    if (!g_mouse_state.window) goto res;
 
     if (!__sync_bool_compare_and_swap(&g_mouse_state.window->id_ptr, &g_mouse_state.window->id, &g_mouse_state.window->id)) {
         debug("%s: %d has been marked invalid by the system, ignoring event..\n", __FUNCTION__, g_mouse_state.window->id);
@@ -1166,8 +1183,17 @@ static EVENT_HANDLER(MOUSE_UP)
         goto err;
     }
 
-    CGPoint point = CGEventGetLocation(context);
     debug("%s: %.2f, %.2f\n", __FUNCTION__, point.x, point.y);
+
+    if (g_mouse_state.picked_up) {
+        mouse_drop_picked_up_window(&g_space_manager, &g_window_manager, &g_mouse_state, point, false);
+        goto err;
+    }
+
+    if (g_mouse_state.live_resize) {
+        mouse_live_resize_update(&g_window_manager, &g_mouse_state, point, true);
+        goto err;
+    }
 
     struct view *src_view = window_manager_find_managed_window(&g_window_manager, g_mouse_state.window);
     if (!src_view) goto err;
@@ -1187,11 +1213,7 @@ static EVENT_HANDLER(MOUSE_UP)
         struct window_node *b_node = window ? view_find_window_node(dst_view, window->id) : NULL;
 
         if (a_node && b_node && a_node != b_node) {
-            if (g_mouse_state.feedback_node) {
-                g_mouse_state.feedback_node->insert_dir = 0;
-                insert_feedback_destroy(g_mouse_state.feedback_node);
-                g_mouse_state.feedback_node = NULL;
-            }
+            mouse_clear_drop_feedback(&g_mouse_state);
 
             enum mouse_drop_action drop_action = mouse_determine_drop_action(&g_mouse_state, a_node, window, point);
             switch (drop_action) {
@@ -1228,6 +1250,9 @@ err:
     g_mouse_state.window = NULL;
 res:
     g_mouse_state.current_action = MOUSE_MODE_NONE;
+    g_mouse_state.drag_decided = false;
+    g_mouse_state.live_resize = false;
+    g_mouse_state.picked_up = false;
 out:
     CFRelease(context);
 }
@@ -1241,12 +1266,24 @@ static EVENT_HANDLER(MOUSE_DRAGGED)
         debug("%s: %d has been marked invalid by the system, ignoring event..\n", __FUNCTION__, g_mouse_state.window->id);
         g_mouse_state.window = NULL;
         g_mouse_state.current_action = MOUSE_MODE_NONE;
+        g_mouse_state.drag_decided = false;
+        g_mouse_state.live_resize = false;
+        g_mouse_state.picked_up = false;
         CFRelease(context);
         return;
     }
 
     CGPoint point = CGEventGetLocation(context);
     debug("%s: %.2f, %.2f\n", __FUNCTION__, point.x, point.y);
+
+    if (!g_mouse_state.drag_decided) {
+        mouse_drag_decide(&g_window_manager, &g_mouse_state, point);
+    }
+
+    if (g_mouse_state.live_resize) {
+        mouse_live_resize_update(&g_window_manager, &g_mouse_state, point, false);
+        goto out;
+    }
 
     if (g_mouse_state.current_action == MOUSE_MODE_MOVE) {
         CGPoint new_point = { g_mouse_state.window_frame.origin.x + (point.x - g_mouse_state.down_location.x),
@@ -1275,6 +1312,11 @@ static EVENT_HANDLER(MOUSE_DRAGGED)
         g_mouse_state.down_location = point;
     }
 
+    if (g_mouse_state.picked_up) {
+        mouse_picked_up_update_feedback(&g_space_manager, &g_window_manager, &g_mouse_state, point);
+        goto out;
+    }
+
     struct view *src_view = window_manager_find_managed_window(&g_window_manager, g_mouse_state.window);
     if (!src_view) goto out;
 
@@ -1293,48 +1335,9 @@ static EVENT_HANDLER(MOUSE_DRAGGED)
         struct window_node *b_node = window ? view_find_window_node(dst_view, window->id) : NULL;
 
         if (a_node && b_node && a_node != b_node) {
-            if (g_mouse_state.feedback_node && g_mouse_state.feedback_node != b_node) {
-                g_mouse_state.feedback_node->insert_dir = 0;
-                insert_feedback_destroy(g_mouse_state.feedback_node);
-            }
-
-            int insert_dir = 0;
-            enum mouse_drop_action drop_action = mouse_determine_drop_action(&g_mouse_state, a_node, window, point);
-            switch (drop_action) {
-            case MOUSE_DROP_ACTION_STACK: {
-                insert_dir = STACK;
-            } break;
-            case MOUSE_DROP_ACTION_SWAP: {
-                insert_dir = STACK;
-            } break;
-            case MOUSE_DROP_ACTION_WARP_TOP: {
-                insert_dir = DIR_NORTH;
-            } break;
-            case MOUSE_DROP_ACTION_WARP_RIGHT: {
-                insert_dir = DIR_EAST;
-            } break;
-            case MOUSE_DROP_ACTION_WARP_BOTTOM: {
-                insert_dir = DIR_SOUTH;
-            } break;
-            case MOUSE_DROP_ACTION_WARP_LEFT: {
-                insert_dir = DIR_WEST;
-            } break;
-            case MOUSE_DROP_ACTION_NONE: {
-                /* silence compiler warning.. */
-            } break;
-            }
-
-            if (b_node->insert_dir != insert_dir) {
-                b_node->insert_dir = insert_dir;
-                insert_feedback_show(b_node);
-                g_mouse_state.feedback_node = b_node;
-            }
+            mouse_show_drop_feedback(&g_mouse_state, a_node, window, b_node, point);
         } else if (!b_node) {
-            if (g_mouse_state.feedback_node) {
-                g_mouse_state.feedback_node->insert_dir = 0;
-                insert_feedback_destroy(g_mouse_state.feedback_node);
-                g_mouse_state.feedback_node = NULL;
-            }
+            mouse_clear_drop_feedback(&g_mouse_state);
         }
     }
 

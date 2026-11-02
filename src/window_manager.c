@@ -706,6 +706,13 @@ void window_manager_animate_window_list(struct window_capture *window_list, int 
 {
     TIME_FUNCTION;
 
+    //
+    // NOTE(eriskii): Set while a compound layout change is being built up; the caller
+    // flushes every affected view once at the end, so partial animations are dropped.
+    //
+
+    if (g_window_manager.suppress_animations) return;
+
     if (g_window_manager.window_animation_duration) {
         window_manager_animate_window_list_async(window_list, window_count);
     } else {
@@ -718,6 +725,8 @@ void window_manager_animate_window_list(struct window_capture *window_list, int 
 void window_manager_animate_window(struct window_capture capture)
 {
     TIME_FUNCTION;
+
+    if (g_window_manager.suppress_animations) return;
 
     if (g_window_manager.window_animation_duration) {
         window_manager_animate_window_list_async(&capture, 1);

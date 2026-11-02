@@ -98,6 +98,7 @@ struct window_manager
     float window_opacity_duration;
     float window_animation_duration;
     int window_animation_easing;
+    bool suppress_animations;
     struct rgba_color insert_feedback_color;
     struct scratchpad *scratchpad_window;
 };

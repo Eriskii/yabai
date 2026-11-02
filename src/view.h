@@ -219,10 +219,28 @@ struct view
 #define view_clear_flag(v, x) ((v)->flags &= ~(x))
 #define view_set_flag(v, x)   ((v)->flags |=  (x))
 
+//
+// NOTE(eriskii): Everything needed to put a temporarily detached window back
+// into the exact slot it was removed from. The parent node survives removal
+// (it absorbs the sibling), so it doubles as the anchor for reattaching.
+//
+
+struct window_node_detach
+{
+    uint64_t sid;
+    struct window_node *parent;
+    enum window_node_child side;
+    enum window_node_split split;
+    float ratio;
+    enum window_node_child child;
+};
+
 void insert_feedback_show(struct window_node *node);
 void insert_feedback_destroy(struct window_node *node);
 
 void window_node_flush(struct window_node *node);
+void window_node_flush_immediate(struct window_node *node, uint32_t exclude_wid);
+bool window_node_is_ancestor(struct window_node *ancestor, struct window_node *node);
 void window_node_update(struct view *view, struct window_node *node);
 bool window_node_contains_window(struct window_node *node, uint32_t window_id);
 int window_node_index_of_window(struct window_node *node, uint32_t window_id);
@@ -239,6 +257,8 @@ void view_stack_window_node(struct window_node *node, struct window *window);
 struct window_node *view_add_window_node_with_insertion_point(struct view *view, struct window *window, uint32_t insertion_point);
 struct window_node *view_add_window_node(struct view *view, struct window *window);
 struct window_node *view_remove_window_node(struct view *view, struct window *window);
+struct window_node *view_detach_window_node(struct view *view, struct window *window, struct window_node_detach *detach);
+struct window_node *view_reattach_window_node(struct view *view, struct window *window, struct window_node_detach *detach);
 uint32_t *view_find_window_list(struct view *view, int *window_count);
 
 void view_serialize(FILE *rsp, struct view *view, uint64_t flags);

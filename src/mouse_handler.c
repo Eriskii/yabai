@@ -115,7 +115,7 @@ enum mouse_drop_action mouse_determine_drop_action(struct mouse_state *ms, struc
     CGPoint b[3] = {{ f.size.width, f.size.height }, { 0.5f * f.size.width, 0.5f * f.size.height }, { 0.0f, f.size.height }};
     CGPoint l[3] = {{ 0.0f, f.size.height }, { 0.5f * f.size.width, 0.5f * f.size.height }, { 0.0f, 0.0f }};
 
-    if ((CGRectContainsPoint(c, wp)) && (src_node->window_count == 1)) {
+    if ((CGRectContainsPoint(c, wp)) && (!src_node || src_node->window_count == 1)) {
         return ms->drop_action == MOUSE_MODE_STACK ? MOUSE_DROP_ACTION_STACK : MOUSE_DROP_ACTION_SWAP;
     } else if (triangle_contains_point(t, wp)) {
         return MOUSE_DROP_ACTION_WARP_TOP;
@@ -260,6 +260,342 @@ end:
     if (!success) {
         struct window_node *node = view_find_window_node(view, window->id);
         if (node) window_node_flush(node);
+    }
+}
+
+void mouse_show_drop_feedback(struct mouse_state *ms, struct window_node *a_node, struct window *window, struct window_node *b_node, CGPoint point)
+{
+    if (ms->feedback_node && ms->feedback_node != b_node) {
+        ms->feedback_node->insert_dir = 0;
+        insert_feedback_destroy(ms->feedback_node);
+    }
+
+    int insert_dir = 0;
+    enum mouse_drop_action drop_action = mouse_determine_drop_action(ms, a_node, window, point);
+    switch (drop_action) {
+    case MOUSE_DROP_ACTION_STACK: {
+        insert_dir = STACK;
+    } break;
+    case MOUSE_DROP_ACTION_SWAP: {
+        insert_dir = STACK;
+    } break;
+    case MOUSE_DROP_ACTION_WARP_TOP: {
+        insert_dir = DIR_NORTH;
+    } break;
+    case MOUSE_DROP_ACTION_WARP_RIGHT: {
+        insert_dir = DIR_EAST;
+    } break;
+    case MOUSE_DROP_ACTION_WARP_BOTTOM: {
+        insert_dir = DIR_SOUTH;
+    } break;
+    case MOUSE_DROP_ACTION_WARP_LEFT: {
+        insert_dir = DIR_WEST;
+    } break;
+    case MOUSE_DROP_ACTION_NONE: {
+        /* silence compiler warning.. */
+    } break;
+    }
+
+    if (b_node->insert_dir != insert_dir) {
+        b_node->insert_dir = insert_dir;
+        insert_feedback_show(b_node);
+        ms->feedback_node = b_node;
+    }
+}
+
+void mouse_clear_drop_feedback(struct mouse_state *ms)
+{
+    if (ms->feedback_node) {
+        ms->feedback_node->insert_dir = 0;
+        insert_feedback_destroy(ms->feedback_node);
+        ms->feedback_node = NULL;
+    }
+}
+
+//
+// NOTE(eriskii): Live layout while dragging.
+//
+// Upstream only re-tiles once the mouse is released. Here, a tiled window that is
+// resized (by its own edges, or modifier + resize) drives its fence ratios on every
+// drag event, so the neighbouring windows follow along in real-time. A tiled window
+// that is moved is picked up: it is detached from the tree immediately so the rest
+// of the layout fills the gap, and is inserted wherever it is dropped.
+//
+
+static bool mouse_live_resize_set_ratio(struct view *view, struct window_node *fence, float edge)
+{
+    int gap = view_check_flag(view, VIEW_ENABLE_GAP) ? view->window_gap : 0;
+
+    float origin = fence->split == SPLIT_Y ? fence->area.x       : fence->area.y;
+    float size   = fence->split == SPLIT_Y ? fence->area.w - gap : fence->area.h - gap;
+    if (size <= 0.0f) return false;
+
+    float ratio = clampf_range((edge - origin) / size, 0.1f, 0.9f);
+    if (ratio == fence->ratio) return false;
+
+    fence->ratio = ratio;
+    return true;
+}
+
+static void mouse_live_resize_flush(struct window_node *x_fence, struct window_node *y_fence, uint32_t exclude_wid)
+{
+    if (x_fence && y_fence) {
+        if (window_node_is_ancestor(x_fence, y_fence)) y_fence = NULL;
+        else if (window_node_is_ancestor(y_fence, x_fence)) x_fence = NULL;
+    }
+
+    if (x_fence) window_node_flush_immediate(x_fence, exclude_wid);
+    if (y_fence) window_node_flush_immediate(y_fence, exclude_wid);
+}
+
+void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoint point)
+{
+    struct view *view = window_manager_find_managed_window(wm, ms->window);
+    if (!view || view->layout != VIEW_BSP) {
+        ms->drag_decided = true;
+        return;
+    }
+
+    if (ms->current_action == MOUSE_MODE_RESIZE) {
+        ms->live_resize  = true;
+        ms->drag_decided = true;
+        return;
+    }
+
+    //
+    // NOTE(eriskii): Don't pick a window up on a few pixels of jitter; the rest of the layout
+    // would close over its slot and a careless release could drop it somewhere else.
+    //
+
+    float dx = point.x - ms->down_location.x;
+    float dy = point.y - ms->down_location.y;
+    bool far_enough = (dx * dx + dy * dy) >= (8.0f * 8.0f);
+
+    bool pick_up = ms->current_action == MOUSE_MODE_MOVE;
+    if (pick_up && !far_enough) return;
+
+    if (ms->current_action == MOUSE_MODE_NONE) {
+
+        //
+        // NOTE(eriskii): A plain drag could be a titlebar move, an edge resize, or just a drag
+        // inside the window's content. Wait until the window server reports which one it is.
+        //
+
+        CGRect frame;
+        SLSGetWindowBounds(g_connection, ms->window->id, &frame);
+
+        if (AX_DIFF(frame.size.width, ms->down_frame.size.width) || AX_DIFF(frame.size.height, ms->down_frame.size.height)) {
+            ms->live_resize  = true;
+            ms->drag_decided = true;
+            return;
+        }
+
+        if (!AX_DIFF(frame.origin.x, ms->down_frame.origin.x) && !AX_DIFF(frame.origin.y, ms->down_frame.origin.y)) return;
+        if (!far_enough) return;
+        pick_up = true;
+    }
+
+    ms->drag_decided = true;
+    if (!pick_up) return;
+
+    mouse_clear_drop_feedback(ms);
+
+    struct window_node *flush_node = view_detach_window_node(view, ms->window, &ms->pickup);
+    if (!flush_node) return;
+
+    window_manager_remove_managed_window(wm, ms->window->id);
+    window_manager_adjust_layer(ms->window, LAYER_NORMAL);
+    ms->picked_up = true;
+
+    if (space_is_visible(view->sid)) {
+        window_node_flush(flush_node);
+    } else {
+        view_set_flag(view, VIEW_IS_DIRTY);
+    }
+}
+
+void mouse_live_resize_update(struct window_manager *wm, struct mouse_state *ms, CGPoint point, bool final)
+{
+    if (!final) {
+        float dt = ((float) read_os_timer() - ms->last_moved_time) * (1000.0f / (float)read_os_freq());
+        if (dt < 16.0f) return;
+    }
+
+    struct view *view = window_manager_find_managed_window(wm, ms->window);
+    if (!view || view->layout != VIEW_BSP) return;
+
+    struct window_node *node = view_find_window_node(view, ms->window->id);
+    if (!node) return;
+
+    CGRect frame = ms->down_frame;
+    uint32_t exclude_wid = 0;
+
+    if (ms->current_action == MOUSE_MODE_RESIZE) {
+        float dx = point.x - ms->down_location.x;
+        float dy = point.y - ms->down_location.y;
+
+        if (ms->direction & HANDLE_LEFT)   { frame.origin.x += dx; frame.size.width  -= dx; }
+        if (ms->direction & HANDLE_RIGHT)  {                       frame.size.width  += dx; }
+        if (ms->direction & HANDLE_TOP)    { frame.origin.y += dy; frame.size.height -= dy; }
+        if (ms->direction & HANDLE_BOTTOM) {                       frame.size.height += dy; }
+    } else {
+        SLSGetWindowBounds(g_connection, ms->window->id, &frame);
+
+        if (AX_DIFF(frame.origin.x, ms->down_frame.origin.x)) {
+            ms->direction |= HANDLE_LEFT;
+        } else if (AX_DIFF(CGRectGetMaxX(frame), CGRectGetMaxX(ms->down_frame))) {
+            ms->direction |= HANDLE_RIGHT;
+        }
+
+        if (AX_DIFF(frame.origin.y, ms->down_frame.origin.y)) {
+            ms->direction |= HANDLE_TOP;
+        } else if (AX_DIFF(CGRectGetMaxY(frame), CGRectGetMaxY(ms->down_frame))) {
+            ms->direction |= HANDLE_BOTTOM;
+        }
+
+        //
+        // NOTE(eriskii): The application is resizing this window itself while the drag is in
+        // progress; only reposition its neighbours, and snap it into its tile on release.
+        //
+
+        if (!final) exclude_wid = ms->window->id;
+    }
+
+    int gap = view_check_flag(view, VIEW_ENABLE_GAP) ? view->window_gap : 0;
+    struct window_node *x_fence = NULL;
+    struct window_node *y_fence = NULL;
+
+    if (ms->direction & HANDLE_LEFT) {
+        struct window_node *fence = window_node_fence(node, DIR_WEST);
+        if (fence && mouse_live_resize_set_ratio(view, fence, frame.origin.x - gap)) y_fence = fence;
+    } else if (ms->direction & HANDLE_RIGHT) {
+        struct window_node *fence = window_node_fence(node, DIR_EAST);
+        if (fence && mouse_live_resize_set_ratio(view, fence, CGRectGetMaxX(frame))) y_fence = fence;
+    }
+
+    if (ms->direction & HANDLE_TOP) {
+        struct window_node *fence = window_node_fence(node, DIR_NORTH);
+        if (fence && mouse_live_resize_set_ratio(view, fence, frame.origin.y - gap)) x_fence = fence;
+    } else if (ms->direction & HANDLE_BOTTOM) {
+        struct window_node *fence = window_node_fence(node, DIR_SOUTH);
+        if (fence && mouse_live_resize_set_ratio(view, fence, CGRectGetMaxY(frame))) x_fence = fence;
+    }
+
+    if (x_fence || y_fence || final) {
+        view_update(view);
+
+        if (!space_is_visible(view->sid)) {
+            view_set_flag(view, VIEW_IS_DIRTY);
+        } else if (final) {
+            window_node_flush_immediate(view->root, 0);
+            view_clear_flag(view, VIEW_IS_DIRTY);
+        } else {
+            mouse_live_resize_flush(x_fence, y_fence, exclude_wid);
+        }
+    }
+
+    ms->last_moved_time = read_os_timer();
+}
+
+static void mouse_find_drop_target(struct space_manager *sm, struct window_manager *wm, struct mouse_state *ms, CGPoint point, struct view **dst_view, struct window **dst_window, struct window_node **dst_node)
+{
+    uint64_t cursor_sid = display_space_id(display_manager_point_display_id(point));
+    *dst_view = space_manager_find_view(sm, cursor_sid);
+
+    struct window *window = window_manager_find_window_at_point_filtering_window(wm, point, ms->window->id);
+    if (!window) window = window_manager_find_window_at_point(wm, point);
+    if (window == ms->window) window = NULL;
+
+    *dst_window = window;
+    *dst_node = window && *dst_view ? view_find_window_node(*dst_view, window->id) : NULL;
+}
+
+void mouse_picked_up_update_feedback(struct space_manager *sm, struct window_manager *wm, struct mouse_state *ms, CGPoint point)
+{
+    struct view *dst_view;
+    struct window *dst_window;
+    struct window_node *dst_node;
+    mouse_find_drop_target(sm, wm, ms, point, &dst_view, &dst_window, &dst_node);
+
+    if (dst_node) {
+        mouse_show_drop_feedback(ms, NULL, dst_window, dst_node, point);
+    } else {
+        mouse_clear_drop_feedback(ms);
+    }
+}
+
+void mouse_drop_picked_up_window(struct space_manager *sm, struct window_manager *wm, struct mouse_state *ms, CGPoint point, bool restore)
+{
+    struct window *src_window = ms->window;
+    struct view *src_view = space_manager_find_view(sm, ms->pickup.sid);
+
+    struct view *dst_view = NULL;
+    struct window *dst_window = NULL;
+    struct window_node *dst_node = NULL;
+    if (!restore) mouse_find_drop_target(sm, wm, ms, point, &dst_view, &dst_window, &dst_node);
+    mouse_clear_drop_feedback(ms);
+
+    enum mouse_drop_action drop_action = dst_node ? mouse_determine_drop_action(ms, NULL, dst_window, point) : MOUSE_DROP_ACTION_NONE;
+    enum window_node_split split = SPLIT_NONE;
+    enum window_node_child child = CHILD_NONE;
+
+    switch (drop_action) {
+    case MOUSE_DROP_ACTION_WARP_TOP:    { split = SPLIT_X; child = CHILD_FIRST;  } break;
+    case MOUSE_DROP_ACTION_WARP_RIGHT:  { split = SPLIT_Y; child = CHILD_SECOND; } break;
+    case MOUSE_DROP_ACTION_WARP_BOTTOM: { split = SPLIT_X; child = CHILD_SECOND; } break;
+    case MOUSE_DROP_ACTION_WARP_LEFT:   { split = SPLIT_Y; child = CHILD_FIRST;  } break;
+    default: break;
+    }
+
+    wm->suppress_animations = true;
+
+    if (split != SPLIT_NONE) {
+
+        //
+        // NOTE(eriskii): Dropped on the edge of a window: tile it next to that window. The slot it
+        // was picked up from is already gone, which is exactly what the user saw while dragging.
+        //
+
+        dst_node->split = split;
+        dst_node->child = child;
+
+        window_manager_adjust_layer(src_window, LAYER_BELOW);
+        view_add_window_node_with_insertion_point(dst_view, src_window, dst_window->id);
+        window_manager_add_managed_window(wm, src_window, dst_view);
+    } else {
+
+        //
+        // NOTE(eriskii): Swap, stack, or no target: put the window back into the slot it came from
+        // first, so the regular drop actions see the same tree they would have without a pickup.
+        //
+
+        struct window_node *src_node = view_reattach_window_node(src_view, src_window, &ms->pickup);
+        if (!src_node && src_view->layout != VIEW_FLOAT) src_node = view_add_window_node(src_view, src_window);
+
+        if (src_node) {
+            window_manager_adjust_layer(src_window, LAYER_BELOW);
+            window_manager_add_managed_window(wm, src_window, src_view);
+
+            if (dst_window && dst_view) dst_node = view_find_window_node(dst_view, dst_window->id);
+
+            if (dst_node && dst_node != src_node && drop_action == MOUSE_DROP_ACTION_SWAP) {
+                mouse_drop_action_swap(wm, src_view, src_node, src_window, dst_view, dst_node, dst_window);
+            } else if (dst_node && dst_node != src_node && drop_action == MOUSE_DROP_ACTION_STACK) {
+                mouse_drop_action_stack(wm, src_view, src_window, dst_view, dst_window);
+            } else if (dst_view && dst_view != src_view) {
+                mouse_drop_no_target(sm, wm, src_view, dst_view, src_window, src_node);
+            }
+        }
+    }
+
+    wm->suppress_animations = false;
+
+    view_update(src_view);
+    view_flush(src_view);
+
+    if (dst_view && dst_view != src_view) {
+        view_update(dst_view);
+        view_flush(dst_view);
     }
 }
 

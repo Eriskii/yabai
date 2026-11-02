@@ -378,6 +378,34 @@ void window_node_flush(struct window_node *node)
     if (window_list) window_manager_animate_window_list(window_list, ts_buf_len(window_list));
 }
 
+void window_node_flush_immediate(struct window_node *node, uint32_t exclude_wid)
+{
+    struct window_capture *window_list = NULL;
+    window_node_capture_windows(node, &window_list);
+
+    for (int i = 0; i < ts_buf_len(window_list); ++i) {
+        if (window_list[i].window->id == exclude_wid) continue;
+        window_manager_set_window_frame(window_list[i].window, window_list[i].x, window_list[i].y, window_list[i].w, window_list[i].h);
+    }
+}
+
+bool window_node_is_ancestor(struct window_node *ancestor, struct window_node *node)
+{
+    for (; node; node = node->parent) {
+        if (node == ancestor) return true;
+    }
+
+    return false;
+}
+
+static bool window_node_is_in_tree(struct window_node *root, struct window_node *node)
+{
+    if (!root)        return false;
+    if (root == node) return true;
+
+    return window_node_is_in_tree(root->left, node) || window_node_is_in_tree(root->right, node);
+}
+
 bool window_node_contains_window(struct window_node *node, uint32_t window_id)
 {
     for (int i = 0; i < node->window_count; ++i) {
@@ -725,6 +753,106 @@ struct window_node *view_remove_window_node(struct view *view, struct window *wi
     }
 
     return parent;
+}
+
+struct window_node *view_detach_window_node(struct view *view, struct window *window, struct window_node_detach *detach)
+{
+    struct window_node *node = view_find_window_node(view, window->id);
+    if (!node || !node->parent || node->window_count != 1 || node->zoom) return NULL;
+
+    struct window_node *parent  = node->parent;
+    struct window_node *sibling = window_node_is_left_child(node) ? parent->right : parent->left;
+
+    detach->sid    = view->sid;
+    detach->parent = parent;
+    detach->side   = window_node_is_left_child(node) ? CHILD_FIRST : CHILD_SECOND;
+    detach->split  = parent->split;
+    detach->ratio  = parent->ratio;
+    detach->child  = parent->child;
+
+    enum window_node_split sibling_split = sibling->split;
+    enum window_node_child sibling_child = sibling->child;
+    float sibling_ratio                  = sibling->ratio;
+
+    struct window_node *flush_node = view_remove_window_node(view, window);
+
+    //
+    // NOTE(eriskii): view_remove_window_node keeps the parent's own split and ratio,
+    // which rotates a promoted subtree. Keep the sibling's shape instead, so the
+    // remaining windows simply grow into the space that was freed.
+    //
+
+    parent->split = sibling_split;
+    parent->child = sibling_child;
+    if (view->auto_balance == SPLIT_NONE) parent->ratio = sibling_ratio;
+
+    view_update(view);
+    return flush_node ? flush_node : parent;
+}
+
+struct window_node *view_reattach_window_node(struct view *view, struct window *window, struct window_node_detach *detach)
+{
+    struct window_node *parent = detach->parent;
+
+    if (view->layout != VIEW_BSP)                                       return NULL;
+    if (!window_node_is_in_tree(view->root, parent))                    return NULL;
+    if (!window_node_is_occupied(parent) && window_node_is_leaf(parent)) return NULL;
+
+    struct window_node *sibling = malloc(sizeof(struct window_node));
+    memset(sibling, 0, sizeof(struct window_node));
+
+    struct window_node *leaf = malloc(sizeof(struct window_node));
+    memset(leaf, 0, sizeof(struct window_node));
+
+    parent->insert_dir = 0;
+    insert_feedback_destroy(parent);
+
+    memcpy(sibling->window_list, parent->window_list, sizeof(uint32_t) * parent->window_count);
+    memcpy(sibling->window_order, parent->window_order, sizeof(uint32_t) * parent->window_count);
+    sibling->window_count = parent->window_count;
+    sibling->left         = parent->left;
+    sibling->right        = parent->right;
+    sibling->split        = parent->split;
+    sibling->ratio        = parent->ratio;
+    sibling->child        = parent->child;
+    sibling->parent       = parent;
+    sibling->zoom         = !g_space_manager.window_zoom_persist
+                          ? NULL
+                          : !parent->zoom
+                          ? NULL
+                          : parent->zoom == parent->parent
+                          ? parent
+                          : view->root;
+
+    if (sibling->left) {
+        sibling->left->parent = sibling;
+        if (sibling->left->zoom == parent) sibling->left->zoom = sibling;
+    }
+
+    if (sibling->right) {
+        sibling->right->parent = sibling;
+        if (sibling->right->zoom == parent) sibling->right->zoom = sibling;
+    }
+
+    leaf->window_list[0]  = window->id;
+    leaf->window_order[0] = window->id;
+    leaf->window_count    = 1;
+    leaf->parent          = parent;
+
+    parent->window_count = 0;
+    parent->zoom         = NULL;
+    parent->left         = detach->side == CHILD_FIRST ? leaf : sibling;
+    parent->right        = detach->side == CHILD_FIRST ? sibling : leaf;
+    parent->split        = detach->split;
+    parent->ratio        = detach->ratio;
+    parent->child        = detach->child;
+
+    if (view->auto_balance != SPLIT_NONE) {
+        window_node_balance(view->root, view->auto_balance);
+    }
+
+    view_update(view);
+    return leaf;
 }
 
 void view_stack_window_node(struct window_node *node, struct window *window)
