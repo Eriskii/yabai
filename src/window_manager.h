@@ -153,6 +153,9 @@ void window_manager_cancel_step_animation(struct window_manager *wm, uint32_t wi
 bool window_manager_is_window_stepping(struct window_manager *wm, uint32_t wid);
 void window_manager_animate_window_list(struct window_capture *window_list, int window_count);
 void window_manager_set_window_frame(struct window *window, float x, float y, float width, float height);
+CGSize window_manager_shrunk_size(CGSize size);
+void window_manager_resize_window_immediate(struct window *window, float width, float height);
+void window_manager_shrink_floated_window(struct window *window);
 int window_manager_find_rank_of_window_in_list(uint32_t wid, uint32_t *window_list, int window_count);
 struct window *window_manager_find_window_on_space_by_rank_filtering_window(struct window_manager *wm, uint64_t sid, int rank, uint32_t filter_wid);
 struct window *window_manager_find_window_at_point_filtering_window(struct window_manager *wm, CGPoint point, uint32_t filter_wid);

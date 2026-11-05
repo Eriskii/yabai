@@ -348,6 +348,25 @@ static void mouse_live_resize_flush(struct window_node *x_fence, struct window_n
     if (y_fence) window_node_flush_immediate(y_fence, exclude_wid);
 }
 
+//
+// NOTE(eriskii): The drag keeps the cursor on the same relative spot of the window as it shrinks.
+//
+
+static void mouse_picked_up_shrink(struct mouse_state *ms)
+{
+    if (!window_check_flag(ms->window, WINDOW_RESIZABLE)) return;
+
+    CGRect frame = ms->window_frame;
+    if (frame.size.width <= 0.0f || frame.size.height <= 0.0f) return;
+
+    CGSize size = window_manager_shrunk_size(frame.size);
+    ms->window_frame.origin.x = ms->down_location.x - (ms->down_location.x - frame.origin.x) * (size.width  / frame.size.width);
+    ms->window_frame.origin.y = ms->down_location.y - (ms->down_location.y - frame.origin.y) * (size.height / frame.size.height);
+    ms->window_frame.size = size;
+
+    window_manager_resize_window_immediate(ms->window, size.width, size.height);
+}
+
 void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoint point)
 {
     struct view *view = window_manager_find_managed_window(wm, ms->window);
@@ -409,6 +428,8 @@ void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoin
     window_manager_remove_managed_window(wm, ms->window->id);
     window_manager_adjust_layer(ms->window, LAYER_NORMAL);
     ms->picked_up = true;
+
+    if (ms->current_action == MOUSE_MODE_MOVE) mouse_picked_up_shrink(ms);
 
     if (space_is_visible(view->sid)) {
         window_node_flush(flush_node);

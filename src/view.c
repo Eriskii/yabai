@@ -759,7 +759,14 @@ struct window_node *view_remove_window_node(struct view *view, struct window *wi
 struct window_node *view_detach_window_node(struct view *view, struct window *window, struct window_node_detach *detach)
 {
     struct window_node *node = view_find_window_node(view, window->id);
-    if (!node || !node->parent || node->window_count != 1 || node->zoom) return NULL;
+    if (!node || node->window_count != 1 || node->zoom) return NULL;
+
+    if (!node->parent) {
+        detach->sid    = view->sid;
+        detach->parent = NULL;
+        view_remove_window_node(view, window);
+        return view->root;
+    }
 
     struct window_node *parent  = node->parent;
     struct window_node *sibling = window_node_is_left_child(node) ? parent->right : parent->left;
@@ -795,6 +802,7 @@ struct window_node *view_reattach_window_node(struct view *view, struct window *
 {
     struct window_node *parent = detach->parent;
 
+    if (!parent)                                                        return NULL;
     if (view->layout != VIEW_BSP)                                       return NULL;
     if (!window_node_is_in_tree(view->root, parent))                    return NULL;
     if (!window_node_is_occupied(parent) && window_node_is_leaf(parent)) return NULL;

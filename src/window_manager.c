@@ -2483,6 +2483,37 @@ void window_manager_make_window_floating(struct space_manager *sm, struct window
     }
 }
 
+//
+// NOTE(eriskii): The size of a window that is picked up, or floated from the tiled layout.
+//
+
+CGSize window_manager_shrunk_size(CGSize size)
+{
+    return CGSizeMake(min(size.width,  max(480.0f, size.width  * 0.6f)),
+                      min(size.height, max(320.0f, size.height * 0.6f)));
+}
+
+void window_manager_resize_window_immediate(struct window *window, float width, float height)
+{
+    AX_ENHANCED_UI_WORKAROUND(window->application->ref, { window_manager_resize_window(window, width, height); });
+}
+
+void window_manager_shrink_floated_window(struct window *window)
+{
+    if (!window_check_flag(window, WINDOW_RESIZABLE)) return;
+
+    CGRect frame = window->frame;
+    CGSize size = window_manager_shrunk_size(frame.size);
+
+    window_manager_animate_window((struct window_capture) {
+        .window = window,
+        .x = frame.origin.x + (frame.size.width  - size.width)  / 2.0f,
+        .y = frame.origin.y + (frame.size.height - size.height) / 2.0f,
+        .w = size.width,
+        .h = size.height
+    });
+}
+
 void window_manager_make_window_sticky(struct space_manager *sm, struct window_manager *wm, struct window *window, bool should_sticky)
 {
     TIME_FUNCTION;
