@@ -1,3 +1,6 @@
+#include <notify.h>
+#include <os/lock.h>
+
 extern mach_port_t g_bs_port;
 extern uint8_t *g_event_bytes;
 extern struct event_loop g_event_loop;
@@ -805,7 +808,16 @@ static void window_manager_animate_window_list_stepped(struct window_manager *wm
             SLSGetWindowBounds(g_connection, window->id, &from);
         }
 
-        if (CGRectEqualToRect(from, to)) continue;
+        //
+        // NOTE(eriskii): A new window sits wherever its application put it, which means nothing to the layout. It goes
+        // straight to its place, rather than travel there from what is usually the middle of the screen.
+        //
+
+        bool snap = !window->laid_out;
+        window->laid_out = true;
+        if (snap) from = to;
+
+        if (!snap && CGRectEqualToRect(from, to)) continue;
         buf_push(step_list, ((struct window_step) { window, window->id, from, to }));
     }
 
@@ -814,6 +826,8 @@ static void window_manager_animate_window_list_stepped(struct window_manager *wm
     wm->step_clock    = read_os_timer();
     wm->step_duration = wm->window_animation_duration;
     wm->step_easing   = wm->window_animation_easing;
+
+    window_manager_update_live_resize_signal(wm);
 
     if (!wm->step_list) return;
 
@@ -836,7 +850,12 @@ void window_manager_step_animation_tick(struct window_manager *wm)
 
     int step_count = buf_len(wm->step_list);
     if (!step_count) {
-        if (wm->step_link && !g_mouse_state.live_resize) CVDisplayLinkStop(wm->step_link);
+        window_manager_update_live_resize_signal(wm);
+
+        if (!g_mouse_state.live_resize) {
+            window_manager_finish_posted_frames();
+            if (wm->step_link) CVDisplayLinkStop(wm->step_link);
+        }
         return;
     }
 
@@ -848,12 +867,17 @@ void window_manager_step_animation_tick(struct window_manager *wm)
         if (window_manager_find_window(wm, step->wid) != step->window) continue;
 
         CGRect frame = window_step_lerp(step->from, mt, step->to);
-        window_manager_set_window_frame(step->window, roundf(frame.origin.x), roundf(frame.origin.y), roundf(frame.size.width), roundf(frame.size.height));
+        if (t >= 1.0f) {
+            window_manager_set_window_frame(step->window, roundf(frame.origin.x), roundf(frame.origin.y), roundf(frame.size.width), roundf(frame.size.height));
+        } else {
+            window_manager_post_window_frame(step->window, CGRectMake(roundf(frame.origin.x), roundf(frame.origin.y), roundf(frame.size.width), roundf(frame.size.height)));
+        }
     }
 
     if (t >= 1.0f) {
         buf_free(wm->step_list);
         wm->step_list = NULL;
+        window_manager_update_live_resize_signal(wm);
         if (!g_mouse_state.live_resize) CVDisplayLinkStop(wm->step_link);
     }
 }
@@ -905,8 +929,190 @@ void window_manager_animate_window(struct window_capture capture)
     window_manager_animate_window_list(&capture, 1);
 }
 
+//
+// NOTE(eriskii): Setting a window's frame blocks until its application gets to it, and an application in a live
+// resize draws before it does. Doing that in turn for each window has the slowest one hold up all of them, and has
+// every window fall behind. For anything that runs per display refresh, each window gets a worker instead, which only
+// ever applies the newest frame.
+//
+
+struct posted_frame
+{
+    uint32_t wid;
+    AXUIElementRef window_ref;
+    AXUIElementRef application_ref;
+    CGRect latest;
+    CGRect applied;
+    bool has_applied;
+    bool checked_atomic;
+    bool atomic;
+    bool dirty;
+    bool working;
+};
+
+static struct posted_frame **g_posted_frames;
+static os_unfair_lock g_posted_frame_lock = OS_UNFAIR_LOCK_INIT;
+static dispatch_group_t g_posted_frame_group;
+
+//
+// NOTE(eriskii): A window's size and position can only be set one at a time, and it gets drawn in between. One that is
+// being resized from its left edge has its right edge jump about. ErisLiveResize takes the two together, if it's there.
+//
+
+static bool window_manager_posted_frame_supports_atomic(struct posted_frame *frame)
+{
+    CFTypeRef value = NULL;
+    AXUIElementCopyAttributeValue(frame->window_ref, CFSTR("AXErisFrameSupported"), &value);
+    if (!value) return false;
+
+    bool result = CFGetTypeID(value) == CFBooleanGetTypeID() ? CFBooleanGetValue(value) : (CFGetTypeID(value) == CFNumberGetTypeID());
+    CFRelease(value);
+    return result;
+}
+
+static void window_manager_posted_frame_work(void *context)
+{
+    struct posted_frame *frame = context;
+
+    for (;;) {
+        os_unfair_lock_lock(&g_posted_frame_lock);
+        if (!frame->dirty) {
+            frame->working = false;
+            os_unfair_lock_unlock(&g_posted_frame_lock);
+            return;
+        }
+        CGRect rect = frame->latest;
+        frame->dirty = false;
+        os_unfair_lock_unlock(&g_posted_frame_lock);
+
+        if (!frame->checked_atomic) {
+            frame->atomic = window_manager_posted_frame_supports_atomic(frame);
+            frame->checked_atomic = true;
+        }
+
+        if (frame->atomic) {
+            if (!frame->has_applied || !CGRectEqualToRect(rect, frame->applied)) {
+                CFTypeRef rect_ref = AXValueCreate(kAXValueTypeCGRect, (void *) &rect);
+                if (rect_ref) {
+                    AXUIElementSetAttributeValue(frame->window_ref, CFSTR("AXErisFrame"), rect_ref);
+                    CFRelease(rect_ref);
+                }
+            }
+
+            frame->applied = rect;
+            frame->has_applied = true;
+            continue;
+        }
+
+        AX_ENHANCED_UI_WORKAROUND(frame->application_ref, {
+            if (!frame->has_applied || !CGSizeEqualToSize(rect.size, frame->applied.size)) {
+                CFTypeRef size_ref = AXValueCreate(kAXValueTypeCGSize, (void *) &rect.size);
+                if (size_ref) {
+                    AXUIElementSetAttributeValue(frame->window_ref, kAXSizeAttribute, size_ref);
+                    CFRelease(size_ref);
+                }
+            }
+
+            if (!frame->has_applied || !CGPointEqualToPoint(rect.origin, frame->applied.origin)) {
+                CFTypeRef position_ref = AXValueCreate(kAXValueTypeCGPoint, (void *) &rect.origin);
+                if (position_ref) {
+                    AXUIElementSetAttributeValue(frame->window_ref, kAXPositionAttribute, position_ref);
+                    CFRelease(position_ref);
+                }
+            }
+        });
+
+        frame->applied = rect;
+        frame->has_applied = true;
+    }
+}
+
+void window_manager_post_window_frame(struct window *window, CGRect rect)
+{
+    if (!g_posted_frame_group) g_posted_frame_group = dispatch_group_create();
+
+    struct posted_frame *frame = NULL;
+    for (int i = 0; i < buf_len(g_posted_frames); ++i) {
+        if (g_posted_frames[i]->wid == window->id) {
+            frame = g_posted_frames[i];
+            break;
+        }
+    }
+
+    if (!frame) {
+        frame = malloc(sizeof(struct posted_frame));
+        memset(frame, 0, sizeof(struct posted_frame));
+        frame->wid = window->id;
+        frame->window_ref = CFRetain(window->ref);
+        frame->application_ref = CFRetain(window->application->ref);
+        buf_push(g_posted_frames, frame);
+    }
+
+    os_unfair_lock_lock(&g_posted_frame_lock);
+    frame->latest = rect;
+    frame->dirty = true;
+    bool start = !frame->working;
+    frame->working = true;
+    os_unfair_lock_unlock(&g_posted_frame_lock);
+
+    if (start) dispatch_group_async_f(g_posted_frame_group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), frame, window_manager_posted_frame_work);
+}
+
+//
+// NOTE(eriskii): Called before setting a frame directly, which nothing should overwrite. A worker stuck on an
+// application that doesn't respond is left to it: its frame stays allocated, as it has nothing newer to apply.
+//
+
+void window_manager_finish_posted_frames(void)
+{
+    int count = buf_len(g_posted_frames);
+    if (!count) return;
+
+    os_unfair_lock_lock(&g_posted_frame_lock);
+    for (int i = 0; i < count; ++i) g_posted_frames[i]->dirty = false;
+    os_unfair_lock_unlock(&g_posted_frame_lock);
+
+    if (dispatch_group_wait(g_posted_frame_group, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC)) == 0) {
+        for (int i = 0; i < count; ++i) {
+            CFRelease(g_posted_frames[i]->window_ref);
+            CFRelease(g_posted_frames[i]->application_ref);
+            free(g_posted_frames[i]);
+        }
+    }
+
+    buf_free(g_posted_frames);
+    g_posted_frames = NULL;
+}
+
+//
+// NOTE(eriskii): Tells apps that windows are being resized from here. ErisLiveResize, loaded into them, puts each
+// window that gets resized meanwhile into the live resize that AppKit runs for a drag of the window's edge, as an app
+// has no other way of telling. Without it this does nothing, and windows are resized the way they always are.
+//
+
+void window_manager_update_live_resize_signal(struct window_manager *wm)
+{
+    static const char *name = "io.github.eriskii.liveresize.active";
+    static int token = -1;
+    static int last = -1;
+
+    int active = g_mouse_state.live_resize || buf_len(wm->step_list) > 0;
+    if (active == last) return;
+
+    if (token < 0 && notify_register_check(name, &token) != NOTIFY_STATUS_OK) {
+        token = -1;
+        return;
+    }
+
+    notify_set_state(token, active);
+    notify_post(name);
+    last = active;
+}
+
 void window_manager_set_window_frame(struct window *window, float x, float y, float width, float height)
 {
+    window_manager_finish_posted_frames();
+
     //
     // NOTE(asmvik): Attempting to check the window frame cache to prevent unnecessary movement and resize calls to the AX API
     // is not reliable because it is possible to perform operations that should be applied, at a higher rate than the AX API events
@@ -2500,6 +2706,8 @@ CGSize window_manager_shrunk_size(CGSize size)
 
 void window_manager_resize_window_immediate(struct window *window, float width, float height)
 {
+    window_manager_finish_posted_frames();
+
     AX_ENHANCED_UI_WORKAROUND(window->application->ref, { window_manager_resize_window(window, width, height); });
 }
 

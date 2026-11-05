@@ -1,6 +1,3 @@
-#include <notify.h>
-#include <os/lock.h>
-
 extern struct event_loop g_event_loop;
 extern volatile bool __pending_gesture;
 extern volatile uint64_t __last_gesture_time;
@@ -340,160 +337,6 @@ static bool mouse_live_resize_set_ratio(struct view *view, struct window_node *f
     return true;
 }
 
-//
-// NOTE(eriskii): Setting a window's frame blocks until its application gets to it, and an application in a live
-// resize draws before it does. Doing that in turn for each window has the slowest one hold up all of them, and has
-// every window fall behind the drag. Each window gets a worker instead, which only ever applies the newest frame.
-//
-
-struct live_frame
-{
-    uint32_t wid;
-    AXUIElementRef window_ref;
-    AXUIElementRef application_ref;
-    CGRect latest;
-    CGRect applied;
-    bool has_applied;
-    bool checked_atomic;
-    bool atomic;
-    bool dirty;
-    bool working;
-};
-
-//
-// NOTE(eriskii): A window's size and position can only be set one at a time, and it gets drawn in between. One that is
-// being resized from its left edge has its right edge jump about. ErisLiveResize takes the two together, if it's there.
-//
-
-static bool mouse_live_frame_supports_atomic(struct live_frame *frame)
-{
-    CFTypeRef value = NULL;
-    AXUIElementCopyAttributeValue(frame->window_ref, CFSTR("AXErisFrameSupported"), &value);
-    if (!value) return false;
-
-    bool result = CFGetTypeID(value) == CFBooleanGetTypeID() ? CFBooleanGetValue(value) : (CFGetTypeID(value) == CFNumberGetTypeID());
-    CFRelease(value);
-    return result;
-}
-
-static struct live_frame **g_live_frames;
-static os_unfair_lock g_live_frame_lock = OS_UNFAIR_LOCK_INIT;
-static dispatch_group_t g_live_frame_group;
-
-static void mouse_live_frame_work(void *context)
-{
-    struct live_frame *frame = context;
-
-    for (;;) {
-        os_unfair_lock_lock(&g_live_frame_lock);
-        if (!frame->dirty) {
-            frame->working = false;
-            os_unfair_lock_unlock(&g_live_frame_lock);
-            return;
-        }
-        CGRect rect = frame->latest;
-        frame->dirty = false;
-        os_unfair_lock_unlock(&g_live_frame_lock);
-
-        if (!frame->checked_atomic) {
-            frame->atomic = mouse_live_frame_supports_atomic(frame);
-            frame->checked_atomic = true;
-        }
-
-        if (frame->atomic) {
-            if (!frame->has_applied || !CGRectEqualToRect(rect, frame->applied)) {
-                CFTypeRef rect_ref = AXValueCreate(kAXValueTypeCGRect, (void *) &rect);
-                if (rect_ref) {
-                    AXUIElementSetAttributeValue(frame->window_ref, CFSTR("AXErisFrame"), rect_ref);
-                    CFRelease(rect_ref);
-                }
-            }
-
-            frame->applied = rect;
-            frame->has_applied = true;
-            continue;
-        }
-
-        AX_ENHANCED_UI_WORKAROUND(frame->application_ref, {
-            if (!frame->has_applied || !CGSizeEqualToSize(rect.size, frame->applied.size)) {
-                CFTypeRef size_ref = AXValueCreate(kAXValueTypeCGSize, (void *) &rect.size);
-                if (size_ref) {
-                    AXUIElementSetAttributeValue(frame->window_ref, kAXSizeAttribute, size_ref);
-                    CFRelease(size_ref);
-                }
-            }
-
-            if (!frame->has_applied || !CGPointEqualToPoint(rect.origin, frame->applied.origin)) {
-                CFTypeRef position_ref = AXValueCreate(kAXValueTypeCGPoint, (void *) &rect.origin);
-                if (position_ref) {
-                    AXUIElementSetAttributeValue(frame->window_ref, kAXPositionAttribute, position_ref);
-                    CFRelease(position_ref);
-                }
-            }
-        });
-
-        frame->applied = rect;
-        frame->has_applied = true;
-    }
-}
-
-static void mouse_live_frame_post(struct window *window, CGRect rect)
-{
-    if (!g_live_frame_group) g_live_frame_group = dispatch_group_create();
-
-    struct live_frame *frame = NULL;
-    for (int i = 0; i < buf_len(g_live_frames); ++i) {
-        if (g_live_frames[i]->wid == window->id) {
-            frame = g_live_frames[i];
-            break;
-        }
-    }
-
-    if (!frame) {
-        frame = malloc(sizeof(struct live_frame));
-        memset(frame, 0, sizeof(struct live_frame));
-        frame->wid = window->id;
-        frame->window_ref = CFRetain(window->ref);
-        frame->application_ref = CFRetain(window->application->ref);
-        buf_push(g_live_frames, frame);
-    }
-
-    os_unfair_lock_lock(&g_live_frame_lock);
-    frame->latest = rect;
-    frame->dirty = true;
-    bool start = !frame->working;
-    frame->working = true;
-    os_unfair_lock_unlock(&g_live_frame_lock);
-
-    if (start) dispatch_group_async_f(g_live_frame_group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), frame, mouse_live_frame_work);
-}
-
-//
-// NOTE(eriskii): Called before the final layout is applied, which nothing should overwrite. A worker stuck on an
-// application that doesn't respond is left to it: its frame stays allocated, as it has nothing newer to apply.
-//
-
-static void mouse_live_frames_finish(void)
-{
-    int count = buf_len(g_live_frames);
-    if (!count) return;
-
-    os_unfair_lock_lock(&g_live_frame_lock);
-    for (int i = 0; i < count; ++i) g_live_frames[i]->dirty = false;
-    os_unfair_lock_unlock(&g_live_frame_lock);
-
-    if (dispatch_group_wait(g_live_frame_group, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC)) == 0) {
-        for (int i = 0; i < count; ++i) {
-            CFRelease(g_live_frames[i]->window_ref);
-            CFRelease(g_live_frames[i]->application_ref);
-            free(g_live_frames[i]);
-        }
-    }
-
-    buf_free(g_live_frames);
-    g_live_frames = NULL;
-}
-
 static void mouse_live_resize_flush_node(struct window_node *node, uint32_t exclude_wid)
 {
     struct window_capture *window_list = NULL;
@@ -502,7 +345,7 @@ static void mouse_live_resize_flush_node(struct window_node *node, uint32_t excl
     for (int i = 0; i < ts_buf_len(window_list); ++i) {
         if (window_list[i].window->id == exclude_wid) continue;
         window_manager_cancel_step_animation(&g_window_manager, window_list[i].window->id);
-        mouse_live_frame_post(window_list[i].window, CGRectMake(window_list[i].x, window_list[i].y, window_list[i].w, window_list[i].h));
+        window_manager_post_window_frame(window_list[i].window, CGRectMake(window_list[i].x, window_list[i].y, window_list[i].w, window_list[i].h));
     }
 }
 
@@ -556,34 +399,14 @@ void mouse_resize_prefer_fenced_edges(struct window_manager *wm, struct mouse_st
     else if ((ms->direction & HANDLE_BOTTOM) && !window_node_fence(node, DIR_SOUTH)) ms->direction ^= HANDLE_TOP | HANDLE_BOTTOM;
 }
 
-//
-// NOTE(eriskii): Tells apps that windows are being resized from here. ErisLiveResize, loaded into them, puts each
-// window that gets resized meanwhile into the live resize that AppKit runs for a drag of the window's edge, as an app
-// has no other way of telling. Without it this does nothing, and windows are resized the way they always are.
-//
-
-static void mouse_live_resize_signal(bool active)
-{
-    static const char *name = "io.github.eriskii.liveresize.active";
-    static int token = -1;
-
-    if (token < 0 && notify_register_check(name, &token) != NOTIFY_STATUS_OK) {
-        token = -1;
-        return;
-    }
-
-    notify_set_state(token, active);
-    notify_post(name);
-}
-
 void mouse_live_resize_set(struct mouse_state *ms, bool active)
 {
     if (ms->live_resize == active) return;
 
-    if (!active) mouse_live_frames_finish();
+    if (!active) window_manager_finish_posted_frames();
 
     ms->live_resize = active;
-    mouse_live_resize_signal(active);
+    window_manager_update_live_resize_signal(&g_window_manager);
 }
 
 void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoint point)
@@ -725,7 +548,6 @@ void mouse_live_resize_update(struct window_manager *wm, struct mouse_state *ms,
         if (!space_is_visible(view->sid)) {
             view_set_flag(view, VIEW_IS_DIRTY);
         } else if (final) {
-            mouse_live_frames_finish();
             window_node_flush_immediate(view->root, 0);
             view_clear_flag(view, VIEW_IS_DIRTY);
         } else {
@@ -861,7 +683,7 @@ bool mouse_handler_begin(struct mouse_state *mouse_state, uint32_t mask)
     CFRunLoopAddSource(CFRunLoopGetMain(), mouse_state->runloop_source, kCFRunLoopCommonModes);
 
     // NOTE(eriskii): We may have died halfway through a resize.
-    mouse_live_resize_signal(false);
+    window_manager_update_live_resize_signal(&g_window_manager);
 
     return true;
 }
