@@ -817,6 +817,11 @@ static void window_manager_animate_window_list_stepped(struct window_manager *wm
 
     if (!wm->step_list) return;
 
+    window_manager_step_link_start(wm);
+}
+
+void window_manager_step_link_start(struct window_manager *wm)
+{
     if (!wm->step_link) {
         CVDisplayLinkCreateWithActiveCGDisplays(&wm->step_link);
         CVDisplayLinkSetOutputCallback(wm->step_link, window_manager_step_animation_display_link_proc, wm);
@@ -831,7 +836,7 @@ void window_manager_step_animation_tick(struct window_manager *wm)
 
     int step_count = buf_len(wm->step_list);
     if (!step_count) {
-        if (wm->step_link) CVDisplayLinkStop(wm->step_link);
+        if (wm->step_link && !g_mouse_state.live_resize) CVDisplayLinkStop(wm->step_link);
         return;
     }
 
@@ -849,7 +854,7 @@ void window_manager_step_animation_tick(struct window_manager *wm)
     if (t >= 1.0f) {
         buf_free(wm->step_list);
         wm->step_list = NULL;
-        CVDisplayLinkStop(wm->step_link);
+        if (!g_mouse_state.live_resize) CVDisplayLinkStop(wm->step_link);
     }
 }
 

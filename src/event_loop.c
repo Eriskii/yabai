@@ -1246,7 +1246,8 @@ static EVENT_HANDLER(MOUSE_DOWN)
     g_mouse_state.down_location = point;
     g_mouse_state.direction = 0;
     g_mouse_state.drag_decided = false;
-    g_mouse_state.live_resize = false;
+    mouse_live_resize_set(&g_mouse_state, false);
+    g_mouse_state.live_resize_dirty = false;
     g_mouse_state.picked_up = false;
     SLSGetWindowBounds(g_connection, window->id, &g_mouse_state.down_frame);
 
@@ -1265,6 +1266,8 @@ static EVENT_HANDLER(MOUSE_DOWN)
         if (point.y < frame_mid.y) g_mouse_state.direction |= HANDLE_TOP;
         if (point.x > frame_mid.x) g_mouse_state.direction |= HANDLE_RIGHT;
         if (point.y > frame_mid.y) g_mouse_state.direction |= HANDLE_BOTTOM;
+
+        mouse_resize_prefer_fenced_edges(&g_window_manager, &g_mouse_state);
     }
 
 out:
@@ -1283,7 +1286,7 @@ static EVENT_HANDLER(MOUSE_UP)
 
         g_mouse_state.picked_up = false;
 
-        g_mouse_state.live_resize = false;
+        mouse_live_resize_set(&g_mouse_state, false);
         goto out;
     }
 
@@ -1382,7 +1385,7 @@ err:
 res:
     g_mouse_state.current_action = MOUSE_MODE_NONE;
     g_mouse_state.drag_decided = false;
-    g_mouse_state.live_resize = false;
+    mouse_live_resize_set(&g_mouse_state, false);
     g_mouse_state.picked_up = false;
 out:
     CFRelease(context);
@@ -1398,7 +1401,7 @@ static EVENT_HANDLER(MOUSE_DRAGGED)
         g_mouse_state.window = NULL;
         g_mouse_state.current_action = MOUSE_MODE_NONE;
         g_mouse_state.drag_decided = false;
-        g_mouse_state.live_resize = false;
+        mouse_live_resize_set(&g_mouse_state, false);
         g_mouse_state.picked_up = false;
         CFRelease(context);
         return;
@@ -1412,7 +1415,15 @@ static EVENT_HANDLER(MOUSE_DRAGGED)
     }
 
     if (g_mouse_state.live_resize) {
-        mouse_live_resize_update(&g_window_manager, &g_mouse_state, point, false);
+
+        //
+        // NOTE(eriskii): Applied on the next display refresh, as the step animations are. Mouse events
+        // arrive at whatever rate the mouse polls at, and throttling on them gives an uneven frame rate.
+        //
+
+        g_mouse_state.live_resize_point = point;
+        g_mouse_state.live_resize_dirty = true;
+        window_manager_step_link_start(&g_window_manager);
         goto out;
     }
 
@@ -1432,7 +1443,7 @@ static EVENT_HANDLER(MOUSE_DRAGGED)
     } else if (g_mouse_state.current_action == MOUSE_MODE_RESIZE) {
         uint64_t event_time = read_os_timer();
         float dt = ((float) event_time - g_mouse_state.last_moved_time) * (1000.0f / (float)read_os_freq());
-        if (dt < 67.67f) goto out;
+        if (dt < 16.0f) goto out;
 
         int dx = point.x - g_mouse_state.down_location.x;
         int dy = point.y - g_mouse_state.down_location.y;
@@ -1749,6 +1760,12 @@ static EVENT_HANDLER(SYSTEM_WOKE)
 #pragma clang diagnostic ignored "-Wunused-parameter"
 static EVENT_HANDLER(WINDOW_ANIMATION_STEP)
 {
+    if (g_mouse_state.live_resize && g_mouse_state.live_resize_dirty && g_mouse_state.window && !mission_control_is_active() &&
+        __sync_bool_compare_and_swap(&g_mouse_state.window->id_ptr, &g_mouse_state.window->id, &g_mouse_state.window->id)) {
+        g_mouse_state.live_resize_dirty = false;
+        mouse_live_resize_update(&g_window_manager, &g_mouse_state, g_mouse_state.live_resize_point, false);
+    }
+
     window_manager_step_animation_tick(&g_window_manager);
 }
 #pragma clang diagnostic pop

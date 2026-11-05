@@ -148,6 +148,7 @@ void window_manager_move_window(struct window *window, float x, float y);
 void window_manager_resize_window(struct window *window, float width, float height);
 enum window_op_error window_manager_adjust_window_ratio(struct window_manager *wm, struct window *window, int action, float ratio);
 void window_manager_animate_window(struct window_capture capture);
+void window_manager_step_link_start(struct window_manager *wm);
 void window_manager_step_animation_tick(struct window_manager *wm);
 void window_manager_cancel_step_animation(struct window_manager *wm, uint32_t wid);
 bool window_manager_is_window_stepping(struct window_manager *wm, uint32_t wid);

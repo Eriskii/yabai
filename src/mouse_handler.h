@@ -81,6 +81,8 @@ struct mouse_state
     struct window_node *feedback_node;
     bool drag_decided;
     bool live_resize;
+    bool live_resize_dirty;
+    CGPoint live_resize_point;
     bool picked_up;
     struct window_node_detach pickup;
 };
@@ -114,6 +116,8 @@ void mouse_drop_try_adjust_bsp_grid(struct window_manager *wm, struct view *view
 void mouse_show_drop_feedback(struct mouse_state *ms, struct window_node *a_node, struct window *window, struct window_node *b_node, CGPoint point);
 void mouse_clear_drop_feedback(struct mouse_state *ms);
 
+void mouse_resize_prefer_fenced_edges(struct window_manager *wm, struct mouse_state *ms);
+void mouse_live_resize_set(struct mouse_state *ms, bool active);
 void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoint point);
 void mouse_live_resize_update(struct window_manager *wm, struct mouse_state *ms, CGPoint point, bool final);
 void mouse_picked_up_update_feedback(struct space_manager *sm, struct window_manager *wm, struct mouse_state *ms, CGPoint point);

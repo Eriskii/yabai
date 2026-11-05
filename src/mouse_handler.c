@@ -1,3 +1,5 @@
+#include <notify.h>
+
 extern struct event_loop g_event_loop;
 extern volatile bool __pending_gesture;
 extern volatile uint64_t __last_gesture_time;
@@ -367,6 +369,54 @@ static void mouse_picked_up_shrink(struct mouse_state *ms)
     window_manager_resize_window_immediate(ms->window, size.width, size.height);
 }
 
+//
+// NOTE(eriskii): The nearest edge of a tiled window may be against the side of the screen, with nothing
+// to resize against; use the far one then.
+//
+
+void mouse_resize_prefer_fenced_edges(struct window_manager *wm, struct mouse_state *ms)
+{
+    struct view *view = window_manager_find_managed_window(wm, ms->window);
+    if (!view) return;
+
+    struct window_node *node = view_find_window_node(view, ms->window->id);
+    if (!node) return;
+
+    if ((ms->direction & HANDLE_LEFT)   && !window_node_fence(node, DIR_WEST))  ms->direction ^= HANDLE_LEFT | HANDLE_RIGHT;
+    else if ((ms->direction & HANDLE_RIGHT)  && !window_node_fence(node, DIR_EAST))  ms->direction ^= HANDLE_LEFT | HANDLE_RIGHT;
+
+    if ((ms->direction & HANDLE_TOP)    && !window_node_fence(node, DIR_NORTH)) ms->direction ^= HANDLE_TOP | HANDLE_BOTTOM;
+    else if ((ms->direction & HANDLE_BOTTOM) && !window_node_fence(node, DIR_SOUTH)) ms->direction ^= HANDLE_TOP | HANDLE_BOTTOM;
+}
+
+//
+// NOTE(eriskii): Tells apps that windows are being resized from here. ErisLiveResize, loaded into them, puts each
+// window that gets resized meanwhile into the live resize that AppKit runs for a drag of the window's edge, as an app
+// has no other way of telling. Without it this does nothing, and windows are resized the way they always are.
+//
+
+static void mouse_live_resize_signal(bool active)
+{
+    static const char *name = "io.github.eriskii.liveresize.active";
+    static int token = -1;
+
+    if (token < 0 && notify_register_check(name, &token) != NOTIFY_STATUS_OK) {
+        token = -1;
+        return;
+    }
+
+    notify_set_state(token, active);
+    notify_post(name);
+}
+
+void mouse_live_resize_set(struct mouse_state *ms, bool active)
+{
+    if (ms->live_resize == active) return;
+
+    ms->live_resize = active;
+    mouse_live_resize_signal(active);
+}
+
 void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoint point)
 {
     struct view *view = window_manager_find_managed_window(wm, ms->window);
@@ -377,7 +427,7 @@ void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoin
 
     if (ms->current_action == MOUSE_MODE_RESIZE) {
         window_manager_cancel_step_animation(wm, ms->window->id);
-        ms->live_resize  = true;
+        mouse_live_resize_set(ms, true);
         ms->drag_decided = true;
         return;
     }
@@ -406,7 +456,7 @@ void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoin
 
         if (AX_DIFF(frame.size.width, ms->down_frame.size.width) || AX_DIFF(frame.size.height, ms->down_frame.size.height)) {
             window_manager_cancel_step_animation(wm, ms->window->id);
-            ms->live_resize  = true;
+            mouse_live_resize_set(ms, true);
             ms->drag_decided = true;
             return;
         }
@@ -440,11 +490,6 @@ void mouse_drag_decide(struct window_manager *wm, struct mouse_state *ms, CGPoin
 
 void mouse_live_resize_update(struct window_manager *wm, struct mouse_state *ms, CGPoint point, bool final)
 {
-    if (!final) {
-        float dt = ((float) read_os_timer() - ms->last_moved_time) * (1000.0f / (float)read_os_freq());
-        if (dt < 16.0f) return;
-    }
-
     struct view *view = window_manager_find_managed_window(wm, ms->window);
     if (!view || view->layout != VIEW_BSP) return;
 
@@ -517,8 +562,6 @@ void mouse_live_resize_update(struct window_manager *wm, struct mouse_state *ms,
             mouse_live_resize_flush(x_fence, y_fence, exclude_wid);
         }
     }
-
-    ms->last_moved_time = read_os_timer();
 }
 
 static void mouse_find_drop_target(struct space_manager *sm, struct window_manager *wm, struct mouse_state *ms, CGPoint point, struct view **dst_view, struct window **dst_window, struct window_node **dst_node)
@@ -646,6 +689,9 @@ bool mouse_handler_begin(struct mouse_state *mouse_state, uint32_t mask)
 
     mouse_state->runloop_source = CFMachPortCreateRunLoopSource(NULL, mouse_state->handle, 0);
     CFRunLoopAddSource(CFRunLoopGetMain(), mouse_state->runloop_source, kCFRunLoopCommonModes);
+
+    // NOTE(eriskii): We may have died halfway through a resize.
+    mouse_live_resize_signal(false);
 
     return true;
 }
