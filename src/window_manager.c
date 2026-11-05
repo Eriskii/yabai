@@ -277,6 +277,14 @@ bool window_manager_should_manage_window(struct window *window)
     if (window_check_flag(window, WINDOW_MINIMIZE)) return false;
     if (window->application->is_hidden)             return false;
 
+    //
+    // NOTE(eriskii): A picked up window is out of the tree until it is dropped, and is put back by the
+    // drop itself. Tiling it in the meantime (the active display changes as it is dragged across
+    // displays, which rescans the space) would leave a slot behind that nothing ever removes.
+    //
+
+    if (g_mouse_state.picked_up && g_mouse_state.window == window) return false;
+
     return (window_is_standard(window) && window_level_is_standard(window) && window_can_move(window)) || window_check_rule_flag(window, WINDOW_RULE_MANAGED);
 }
 
